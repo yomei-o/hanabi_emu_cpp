@@ -40,8 +40,8 @@ static const double RHO_AIR = 1.225;           // 空気密度 [kg/m^3]
 static const double CD = 0.47;                 // 球の抗力係数
 static const double RHO_STAR = 1750.0;         // 星の密度 [kg/m^3]
 static const double RHO_SHELL = 800.0;         // 玉の平均密度 [kg/m^3]
-static const size_t MAX_SPARKS = 110000;
-static const size_t MAX_STARS = 60000;
+static const size_t MAX_SPARKS = 560000;   // 連打(スターマイン)を捌くための粒子予算
+static const size_t MAX_STARS = 120000;
 
 // ---------------------------------------------------------------- 乱数
 static uint32_t rng = 88675123u;
@@ -147,6 +147,7 @@ struct Shell {
     ShellSpec sp;
     int layers;
     int scheme;
+    int type;              // 0=菊 1=牡丹(尾なし) 2=柳(低速・長燃焼)
     bool alive;
 };
 struct Flash { double x, y, z; double t, t0, pw; bool alive; };
@@ -170,9 +171,19 @@ static double p_layers = 1.0;    // 芯の数 (0=菊, 1=芯入, 2=八重芯)
 static double p_glow = 0.82;     // 残光(加算バッファの減衰)
 static bool   p_auto = true;
 
+static double p_shots = 100.0;   // スターマインの発数
+static double p_rapid = 0.22;    // 連打間隔 [s]
+
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
 static long   frameNo = 0;
+
+// スターマイン(早打ち)の状態 — 全部インクリメンタルに減っていく
+static int    barLeft = 0, barTotal = 0;
+static double barTimer = 0.0;
+
+// 粒子予算に対する負荷から引先の量を自動調整する係数(一次遅れ = 差分式)
+static double qual = 1.0;
 // 実測値(毎ステップ running max で更新する = これも差分式)
 static double measH = 0.0, measD = 0.0;
 
@@ -197,13 +208,13 @@ static void scheme_colors(int s, int layer, Col& c0, Col& c1, float& chg, Col& t
     case 0: // 錦冠 — 木炭の金一色。菊の基本形
         c0 = C_GOLD; c1 = C_AMBER; chg = 0.55f; tail = C_GOLD; break;
     case 1: // 単色 + 金の引先
-        c0 = tbl[(int)(rnd() * 6)]; c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.55f); break;
+        c0 = tbl[(int)(rnd() * 6)]; c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.38f); break;
     case 2: // 変化菊 — 途中で色が変わる
         c0 = tbl[(int)(rnd() * 6)]; c1 = tbl[(int)(rnd() * 6)]; chg = 0.5f;
-        tail = mixc(c0, C_GOLD, 0.5f); break;
+        tail = mixc(c0, C_GOLD, 0.35f); break;
     default: // 芯替わり — 層ごとに別の色
         c0 = tbl[(layer * 2 + 1) % 6]; c1 = c0; chg = 1.0f;
-        tail = mixc(c0, C_GOLD, 0.5f); break;
+        tail = mixc(c0, C_GOLD, 0.35f); break;
     }
     if (s >= 3 && layer == 0) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.6f; tail = C_GOLD; }
 }
@@ -302,7 +313,11 @@ static void emit_spark(double x, double y, double z, double vx, double vy, doubl
 
 static void burst(Shell& sh) {
     const ShellSpec& s = sh.sp;
-    int layers = 1 + sh.layers;
+    // 玉種による味付け。物理量(初速・燃焼時間・剥離量)を変えるだけで見た目は勝手に変わる
+    double tv = 1.0, tb = 1.0, tshed = 1.0;
+    if (sh.type == 1) { tv = 1.10; tb = 0.75; tshed = 0.0;  }   // 牡丹 — 尾を引かない
+    if (sh.type == 2) { tv = 0.48; tb = 1.95; tshed = 1.7;  }   // 柳   — 低速で長く燃え、垂れる
+    int layers = 1 + (sh.type == 2 ? 0 : sh.layers);            // 柳に芯は入れない
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
         int n = (int)(s.nstar * p_density * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
@@ -317,7 +332,8 @@ static void burst(Shell& sh) {
         double a1 = rnd() * 6.2831853, a2 = rnd() * 6.2831853;
         double ca1 = cos(a1), sa1 = sin(a1), ca2 = cos(a2), sa2 = sin(a2);
         double rstar = s.starR * (L == 0 ? 1.0 : 0.82);
-        double burnT = s.burnT * (L == 0 ? 1.0 : 0.8);
+        double burnT = s.burnT * (L == 0 ? 1.0 : 0.8) * tb;
+        if (sh.type == 2) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
 
         for (int i = 0; i < n; ++i) {
             double yy = 1.0 - 2.0 * (i + 0.5) / n;
@@ -331,7 +347,7 @@ static void burst(Shell& sh) {
             t = dx * ca2 - dz * sa2; dz = dx * sa2 + dz * ca2; dx = t;   // Y 回転
             double dl = sqrt(dx * dx + dy * dy + dz * dz); dx /= dl; dy /= dl; dz /= dl;
 
-            double v = s.starV * vscale * (1.0 + rnds() * 0.035);
+            double v = s.starV * vscale * tv * (1.0 + rnds() * 0.035);
             Star st;
             st.x = sh.x; st.y = sh.y; st.z = sh.z;
             st.bx = (float)sh.x; st.by = (float)sh.y; st.bz = (float)sh.z;
@@ -340,38 +356,48 @@ static void burst(Shell& sh) {
             st.dr = st.r0 / (burnT * (1.0 + rnds() * 0.06));
             st.shed = rnd();
             st.c0 = c0; st.c1 = c1; st.chg = chg; st.tail = tail;
-            st.shedRate = (float)(115.0 * p_shed);
+            st.shedRate = (float)(115.0 * p_shed * tshed);
             st.alive = true;
             stars.push_back(st);
         }
     }
     if (flashes.size() < 64) {
         Flash f; f.x = sh.x; f.y = sh.y; f.z = sh.z;
-        f.t0 = f.t = 0.16; f.pw = 9.0 * s.go; f.alive = true;
+        f.t0 = f.t = 0.10; f.pw = 3.2 * s.go; f.alive = true;
         flashes.push_back(f);
     }
     sh.alive = false;
 }
 
-static void launch(double nx) {
-    if (shells.size() > 12) return;
-    ShellSpec s = curSpec;
+// nx: 画面内の水平位置 [-1,1] (-1000 でランダム) / go: 号数 / type: 0=菊 1=牡丹 2=柳
+static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
+    if (shells.size() >= 90) return;
+    if (go < 3.0) go = 3.0;
+    ShellSpec s = spec_of(go);
     Shell sh;
     double halfW = (FW * 0.5) * camD / camF;
-    sh.x = (nx > -900) ? (nx * halfW * 0.72) : rnds() * halfW * 0.6;
-    sh.z = rnds() * camD * 0.14;
+    sh.x = (nx > -900) ? (nx * halfW * 0.80) : rnds() * halfW * 0.70;
+    sh.z = rnds() * camD * 0.16;
     sh.y = 0.0;
     sh.k = 0.5 * RHO_AIR * CD * (M_PI * s.dia * s.dia * 0.25) / s.mass;
     // 打揚薬が与える初速。ここから先は積分するだけ — 到達高度は結果として出る
     sh.vx = rnds() * 1.2; sh.vy = s.liftV * (1.0 + rnds() * 0.02); sh.vz = rnds() * 1.2;
     sh.shed = 0;
-    sh.fuse = s.fuseT * (1.0 + rnds() * 0.03);   // 時限導火線に点火
+    sh.fuse = s.fuseT * (1.0 + rnds() * fuseJit);   // 時限導火線に点火(秒時のばらつき=開発高度のばらつき)
     sh.sp = s;
+    sh.type = type;
     sh.layers = (int)(p_layers + 0.5);
     double q = rnd();
     sh.scheme = (sh.layers > 0 && q < 0.30) ? 3 : (q < 0.55 ? 0 : (q < 0.85 ? 1 : 2));
     sh.alive = true;
     shells.push_back(sh);
+}
+static void launch(double nx) { launch_ex(nx, p_go, 0); }
+
+// スターマイン(早打ち) — 発数だけ装填して、あとは連打間隔を差分で消化していく
+static void start_barrage() {
+    barTotal = barLeft = (int)(p_shots + 0.5);
+    barTimer = 0.0;
 }
 
 // ---------------------------------------------------------------- ABI
@@ -386,6 +412,7 @@ KEEP void sim_reset() {
     acc.assign((size_t)FW * FH * 3, 0.0f);
     simTime = 0; launchTimer = 0.4; frameNo = 0;
     measH = 0; measD = 0;
+    barLeft = barTotal = 0; barTimer = 0; qual = 1.0;
     curSpec = spec_of(p_go);
     setup_camera(curSpec);
     build_bg();
@@ -416,6 +443,8 @@ KEEP void sim_set(int id, double v) {
     case 4: p_shed = v; break;
     case 5: p_layers = floor(v + 0.5); break;
     case 6: p_glow = v; break;
+    case 7: p_shots = v; break;
+    case 8: p_rapid = v; break;
     }
 }
 
@@ -423,6 +452,8 @@ KEEP void sim_action(int id) {
     if (id == 0) launch(-1000.0);            // 手動で1発
     else if (id == 1) sim_reset();
     else if (id == 2) p_auto = !p_auto;
+    else if (id == 3) start_barrage();       // スターマイン
+    else if (id == 4) barLeft = 0;           // 連打中止
 }
 
 KEEP void sim_click(double nx, double ny) {
@@ -436,11 +467,46 @@ KEEP void sim_step(int frames) {
             const double dt = DT;
             simTime += dt;
 
-            // --- 打ち上げ間隔
-            if (p_auto) {
+            // --- 粒子予算の負荷から引先の量を追従調整(一次遅れ)
+            {
+                double load = (double)sparks.size() / (double)MAX_SPARKS;
+                double tgt = (load < 0.55) ? 1.0 : std::max(0.10, 1.0 - (load - 0.55) / 0.45);
+                qual += (tgt - qual) * 0.05;
+            }
+
+            // --- スターマイン(早打ち連打)
+            if (barLeft > 0) {
+                barTimer -= dt;
+                if (barTimer <= 0.0) {
+                    int volley = 1 + (int)(rnd() * 2.7);          // 1〜3発同時に上がる
+                    for (int v = 0; v < volley && barLeft > 0; ++v) {
+                        bool last = (barLeft == 1);
+                        double go, ty;
+                        if (last) { go = p_go; ty = 0; }                       // 締めは大玉の菊
+                        else if (rnd() < 0.12) { go = p_go; ty = (rnd() < 0.35) ? 2 : 0; }
+                        else {
+                            go = floor(p_go * (0.45 + 0.50 * rnd()) + 0.5);    // 小玉主体の早打ち
+                            double q = rnd();
+                            ty = (q < 0.62) ? 0 : (q < 0.85 ? 1 : 2);
+                        }
+                        // 左右に掃引しながら上げる(実際のスターマインの並び)
+                        double prog = 1.0 - (double)barLeft / (double)barTotal;
+                        double sweep = sin(prog * 15.7) * 0.82 + rnds() * 0.30;   // 左右2.5往復
+                        if (last) sweep = rnds() * 0.15;
+                        launch_ex(sweep, go, (int)ty, last ? 0.02 : 0.13);
+                        barLeft--;
+                    }
+                    barTimer = p_rapid * (0.55 + 0.9 * rnd());
+                    if (barLeft == 1) barTimer += 0.9;            // 締めの前に一拍おく
+                }
+            }
+
+            // --- 通常の打ち上げ間隔
+            if (p_auto && barLeft == 0) {
                 launchTimer -= dt;
                 if (launchTimer <= 0.0) {
-                    launch(-1000.0);
+                    double q = rnd();
+                    launch_ex(-1000.0, p_go, q < 0.72 ? 0 : (q < 0.9 ? 1 : 2));
                     launchTimer = p_interval * (0.75 + 0.5 * rnd());
                 }
             }
@@ -456,7 +522,7 @@ KEEP void sim_step(int frames) {
                 sh.vz += (-sh.k * sp * vrz) * dt;
                 sh.x += sh.vx * dt; sh.y += sh.vy * dt; sh.z += sh.vz * dt;
                 // 昇り曲導
-                sh.shed += 150.0 * p_shed * dt;
+                sh.shed += 150.0 * p_shed * qual * dt;
                 while (sh.shed >= 1.0) {
                     sh.shed -= 1.0;
                     emit_spark(sh.x, sh.y, sh.z,
@@ -492,7 +558,7 @@ KEEP void sim_step(int frames) {
                 double prog = 1.0 - st.r / st.r0;
                 Col hc = (prog < st.chg) ? st.c0 : st.c1;
                 (void)hc;
-                st.shed += st.shedRate * dt;
+                st.shed += st.shedRate * qual * dt;
                 while (st.shed >= 1.0) {
                     st.shed -= 1.0;
                     emit_spark(st.x, st.y, st.z,
@@ -589,8 +655,13 @@ KEEP uint8_t* sim_render() {
     snprintf(buf, sizeof(buf), "KIKU %d-GO %.0fmm  lift %.0f  burst %.0f m/s -> H %.0fm  flower %.0fm",
              (int)p_go, curSpec.dia * 1000.0, curSpec.liftV, curSpec.starV, measH, measD * 2.0);
     olivec_text(oc, buf, 14, 12, olivec_default_font, 2, rgb(255, 190, 90));
-    snprintf(buf, sizeof(buf), "stars %5d   sparks %6d   shells %d   t=%.1fs",
-             (int)stars.size(), (int)sparks.size(), (int)shells.size(), simTime);
+    if (barLeft > 0)
+        snprintf(buf, sizeof(buf), "STARMINE %d/%d   stars %d  sparks %d  shells %d  q%.2f",
+                 barTotal - barLeft, barTotal, (int)stars.size(), (int)sparks.size(),
+                 (int)shells.size(), qual);
+    else
+        snprintf(buf, sizeof(buf), "stars %5d   sparks %6d   shells %d   t=%.1fs",
+                 (int)stars.size(), (int)sparks.size(), (int)shells.size(), simTime);
     olivec_text(oc, buf, 14, FH - 26, olivec_default_font, 2, rgb(150, 160, 190));
     return (uint8_t*)px.data();
 }
@@ -607,7 +678,9 @@ int main(int argc, char** argv) {
     sim_init(0, 0);
     int steps = argc > 1 ? atoi(argv[1]) : 480;
     const char* out = argc > 2 ? argv[2] : "hanabi_preview.png";
-    for (int i = 0; i < steps; ++i) { sim_step(1); if (i % 60 == 0) sim_render(); }
+    int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
+    if (barrage) { sim_set(7, barrage); sim_action(3); }
+    for (int i = 0; i < steps; ++i) { sim_step(1); sim_render(); }   // 毎フレーム描画 = 実負荷
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;
     printf("hanabi_os native: %dx%d  frames=%d  stars=%d sparks=%d  lit=%d\n",

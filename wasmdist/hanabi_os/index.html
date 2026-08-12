@@ -32,7 +32,8 @@
     <b>時限導火線</b>が焼き切れて開発、<b>割薬</b>が玉皮の内側に詰めた<b>星</b>を球面状に飛散させます。
     星は燃焼で半径が減るので質量・断面積・弾道係数が刻々変わり、小さくなるほど急減速する — これが菊の形。
     尾(引先)は星から剥がれる燃えかすを実粒子として飛ばしています。<b>到達高度も開花直径も積分の結果</b>で、
-    表から読んだ値ではありません。計算も描画もすべて C++ → WASM。クリックでその位置から打ち上げ。
+    表から読んだ値ではありません。計算も描画もすべて C++ → WASM。クリックでその位置から打ち上げ。<br>
+    <b>🎆 スターマイン</b>を押すと花火大会のクライマックス（既定 100 連発）。星は数千個、火の粉は数十万粒が同時に飛びます。
   </p>
   <canvas id="cv"></canvas>
   <div id="panel"></div>
@@ -52,8 +53,15 @@ const CONFIG = {
     { id:3, label:"風速 [m/s]",      min:-8,   max:8,   step:0.5,  val:1.5,  dec:1 },
     { id:4, label:"火の粉(引先)",    min:0,    max:2,   step:0.05, val:1.0,  dec:2 },
     { id:6, label:"残光",            min:0.60, max:0.94,step:0.01, val:0.82, dec:2 },
+    { id:7, label:"連打の発数",      min:20,   max:300, step:10,   val:100,  dec:0 },
+    { id:8, label:"連打間隔 [s]",    min:0.05, max:0.8, step:0.01, val:0.22, dec:2 },
   ],
-  buttons: [ { action:0, label:"🎇 1発打ち上げ" }, { action:2, label:"⏱ 連発 ON/OFF" } ],
+  buttons: [
+    { action:3, label:"🎆 スターマイン(連打)" },
+    { action:0, label:"🎇 1発打ち上げ" },
+    { action:4, label:"■ 連打中止" },
+    { action:2, label:"⏱ 単発連発 ON/OFF" },
+  ],
   clickable: true,
   stepsPerFrame: 1,
 };
@@ -104,12 +112,17 @@ function buildPanel(){
 }
 
 function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }
+// 連打で fps が落ちてもスローモーションにならないよう、経過時間ぶんだけ物理を進める
+// (描画は1回。1フレームあたり最大3ステップまで)
+let lag=0;
 function loop(ts){
   if(!playing) return;
-  api.step(CONFIG.stepsPerFrame); blit(); frames++;
-  if(lastT){ const f=1000/(ts-lastT); fpsAvg = fpsAvg? fpsAvg*0.9+f*0.1 : f; }
+  if(lastT){ lag += Math.min(120, ts-lastT); const f=1000/(ts-lastT); fpsAvg = fpsAvg? fpsAvg*0.9+f*0.1 : f; }
   lastT=ts;
-  statusEl.textContent=`frame ${frames}   ${fpsAvg.toFixed(0)} fps`;
+  let n = Math.max(1, Math.min(3, Math.round(lag/16.667)));
+  lag = Math.max(0, lag - n*16.667);
+  api.step(n); blit(); frames+=n;
+  statusEl.textContent=`frame ${frames}   ${fpsAvg.toFixed(0)} fps   x${n}`;
   raf=requestAnimationFrame(loop);
 }
 
