@@ -1,0 +1,4 @@
+hanabi
+*.o
+*.dSYM/
+hanabi_preview.png

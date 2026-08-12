@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hanabi OS - 打ち上げ花火 / 菊 (C++/WASM)</title>
+<style>
+  :root{ --fg:#ffb347; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#05050a; color:var(--fg); font-family:'Courier New',monospace;
+        min-height:100vh; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px; }
+  h1{ font-size:16px; margin:0; font-weight:700; }
+  .sub{ font-size:12px; color:#c08a52; max-width:960px; text-align:center; line-height:1.6; }
+  canvas{ width:min(96vw,960px); height:auto; image-rendering:pixelated; background:#05050a;
+          border:1px solid #533; border-radius:6px; box-shadow:0 6px 26px #000a; cursor:crosshair; }
+  #panel{ display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:center; max-width:960px; }
+  .ctl{ display:flex; flex-direction:column; font-size:11px; color:#c08a52; min-width:150px; }
+  .ctl b{ color:var(--fg); }
+  input[type=range]{ accent-color:var(--fg); }
+  button{ font-family:inherit; font-size:13px; padding:7px 13px; border:1px solid #a63; border-radius:6px;
+          background:#201408; color:var(--fg); cursor:pointer; }
+  button:hover{ background:#33200c; }
+  button.primary{ background:var(--fg); color:#13100a; border:none; font-weight:700; }
+  #status{ font-size:12px; color:#c08a52; font-variant-numeric:tabular-nums; min-height:1.2em; }
+  a{ color:var(--fg); }
+</style>
+</head>
+<body>
+  <h1>🎆 打ち上げ花火シミュレータ — 菊 <span style="color:#c08a52;font-size:12px">(C++ / WASM)</span></h1>
+  <p class="sub">
+    本物の花火玉の中身を1個ずつ計算します。<b>打揚薬の初速</b>で玉が上がり(球の二次空気抵抗+重力)、
+    <b>時限導火線</b>が焼き切れて開発、<b>割薬</b>が玉皮の内側に詰めた<b>星</b>を球面状に飛散させます。
+    星は燃焼で半径が減るので質量・断面積・弾道係数が刻々変わり、小さくなるほど急減速する — これが菊の形。
+    尾(引先)は星から剥がれる燃えかすを実粒子として飛ばしています。<b>到達高度も開花直径も積分の結果</b>で、
+    表から読んだ値ではありません。計算も描画もすべて C++ → WASM。クリックでその位置から打ち上げ。
+  </p>
+  <canvas id="cv"></canvas>
+  <div id="panel"></div>
+  <div id="status">読み込み中…</div>
+  <p class="sub">ソース: <a href="https://github.com/yomei-o/hanabi_emu_cpp">github.com/yomei-o/hanabi_emu_cpp</a></p>
+
+<script src="sim.js"></script>
+<script>
+"use strict";
+// ---- per-sim config ----
+const CONFIG = {
+  sliders: [
+    { id:0, label:"号数 (寸)",       min:3,    max:10,  step:1,    val:5,    dec:0 },
+    { id:1, label:"星の数",          min:0.4,  max:1.8, step:0.05, val:1.0,  dec:2 },
+    { id:5, label:"芯の数",          min:0,    max:2,   step:1,    val:1,    dec:0 },
+    { id:2, label:"打上間隔 [s]",    min:0.6,  max:6.0, step:0.1,  val:2.2,  dec:1 },
+    { id:3, label:"風速 [m/s]",      min:-8,   max:8,   step:0.5,  val:1.5,  dec:1 },
+    { id:4, label:"火の粉(引先)",    min:0,    max:2,   step:0.05, val:1.0,  dec:2 },
+    { id:6, label:"残光",            min:0.60, max:0.94,step:0.01, val:0.82, dec:2 },
+  ],
+  buttons: [ { action:0, label:"🎇 1発打ち上げ" }, { action:2, label:"⏱ 連発 ON/OFF" } ],
+  clickable: true,
+  stepsPerFrame: 1,
+};
+
+// ---- generic harness (universe_cpp と同じ) ----
+const $=id=>document.getElementById(id);
+const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
+let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
+
+createSim().then(mod=>{
+  M=mod;
+  api.init  =M.cwrap("sim_init","number",["number","number"]);
+  api.w     =M.cwrap("sim_w","number",[]);
+  api.h     =M.cwrap("sim_h","number",[]);
+  api.reset =M.cwrap("sim_reset",null,[]);
+  api.step  =M.cwrap("sim_step",null,["number"]);
+  api.render=M.cwrap("sim_render","number",[]);
+  api.click =M.cwrap("sim_click",null,["number","number"]);
+  api.set   =M.cwrap("sim_set",null,["number","number"]);
+  api.action=M.cwrap("sim_action",null,["number"]);
+  api.init(0,0);
+  W=api.w(); H=api.h(); cv.width=W; cv.height=H; img=ctx.createImageData(W,H);
+  buildPanel();
+  CONFIG.sliders.forEach(s=>api.set(s.id, s.val));
+  loop();
+});
+
+function buildPanel(){
+  CONFIG.sliders.forEach(s=>{
+    const wrap=document.createElement("label"); wrap.className="ctl";
+    const head=document.createElement("span"); head.innerHTML=`${s.label} <b id="v${s.id}">${(+s.val).toFixed(s.dec)}</b>`;
+    const inp=document.createElement("input"); inp.type="range";
+    inp.min=s.min; inp.max=s.max; inp.step=s.step; inp.value=s.val;
+    inp.addEventListener("input",()=>{ $("v"+s.id).textContent=(+inp.value).toFixed(s.dec); if(M)api.set(s.id,+inp.value); });
+    wrap.appendChild(head); wrap.appendChild(inp); panel.appendChild(wrap);
+  });
+  CONFIG.buttons.forEach(b=>{
+    const btn=document.createElement("button"); btn.textContent=b.label;
+    btn.addEventListener("click",()=>{ if(M)api.action(b.action); });
+    panel.appendChild(btn);
+  });
+  const pp=document.createElement("button"); pp.className="primary"; pp.textContent="⏸ 一時停止";
+  pp.addEventListener("click",()=>{ playing=!playing; pp.textContent=playing?"⏸ 一時停止":"▶ 再生"; if(playing){lastT=0;loop();} });
+  panel.appendChild(pp);
+  const rs=document.createElement("button"); rs.textContent="⟲ リセット";
+  rs.addEventListener("click",()=>{ if(M){api.reset(); frames=0; if(!playing){api.step(0);blit();}} });
+  panel.appendChild(rs);
+}
+
+function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }
+function loop(ts){
+  if(!playing) return;
+  api.step(CONFIG.stepsPerFrame); blit(); frames++;
+  if(lastT){ const f=1000/(ts-lastT); fpsAvg = fpsAvg? fpsAvg*0.9+f*0.1 : f; }
+  lastT=ts;
+  statusEl.textContent=`frame ${frames}   ${fpsAvg.toFixed(0)} fps`;
+  raf=requestAnimationFrame(loop);
+}
+
+if(CONFIG.clickable){
+  const emit=e=>{ const r=cv.getBoundingClientRect();
+    api.click((e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height); };
+  cv.addEventListener("pointerdown",e=>{ if(M)emit(e); });
+}
+</script>
+</body>
+</html>
