@@ -18,9 +18,16 @@
   .ctl b{ color:var(--fg); }
   input[type=range]{ accent-color:var(--fg); }
   button{ font-family:inherit; font-size:13px; padding:7px 13px; border:1px solid #a63; border-radius:6px;
-          background:#201408; color:var(--fg); cursor:pointer; }
+          background:#201408; color:var(--fg); cursor:pointer; transition:background .12s, box-shadow .12s;
+          min-width:170px; }
   button:hover{ background:#33200c; }
+  button:active{ transform:translateY(1px); }
   button.primary{ background:var(--fg); color:#13100a; border:none; font-weight:700; }
+  /* 押した瞬間に光る */
+  button.hit{ background:#ffd9a0; color:#13100a; box-shadow:0 0 14px #ffb347; }
+  /* トグルが ON のとき点灯しっぱなし */
+  button.on{ background:#7a3f00; color:#ffe0b0; border-color:#ffb347; box-shadow:0 0 10px #a6600030; }
+  button.running{ background:#a33; border-color:#f66; color:#ffe; }
   #status{ font-size:12px; color:#c08a52; font-variant-numeric:tabular-nums; min-height:1.2em; }
   a{ color:var(--fg); }
 </style>
@@ -56,12 +63,6 @@ const CONFIG = {
     { id:7, label:"連打の発数",      min:20,   max:300, step:10,   val:100,  dec:0 },
     { id:8, label:"連打間隔 [s]",    min:0.05, max:0.8, step:0.01, val:0.22, dec:2 },
   ],
-  buttons: [
-    { action:3, label:"🎆 スターマイン(連打)" },
-    { action:0, label:"🎇 1発打ち上げ" },
-    { action:4, label:"■ 連打中止" },
-    { action:2, label:"⏱ 単発連発 ON/OFF" },
-  ],
   clickable: true,
   stepsPerFrame: 1,
 };
@@ -70,6 +71,7 @@ const CONFIG = {
 const $=id=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
 let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
+let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null;
 
 createSim().then(mod=>{
   M=mod;
@@ -82,6 +84,7 @@ createSim().then(mod=>{
   api.click =M.cwrap("sim_click",null,["number","number"]);
   api.set   =M.cwrap("sim_set",null,["number","number"]);
   api.action=M.cwrap("sim_action",null,["number"]);
+  api.get   =M.cwrap("sim_get","number",["number"]);
   api.init(0,0);
   W=api.w(); H=api.h(); cv.width=W; cv.height=H; img=ctx.createImageData(W,H);
   buildPanel();
@@ -98,17 +101,48 @@ function buildPanel(){
     inp.addEventListener("input",()=>{ $("v"+s.id).textContent=(+inp.value).toFixed(s.dec); if(M)api.set(s.id,+inp.value); });
     wrap.appendChild(head); wrap.appendChild(inp); panel.appendChild(wrap);
   });
-  CONFIG.buttons.forEach(b=>{
-    const btn=document.createElement("button"); btn.textContent=b.label;
-    btn.addEventListener("click",()=>{ if(M)api.action(b.action); });
-    panel.appendChild(btn);
-  });
-  const pp=document.createElement("button"); pp.className="primary"; pp.textContent="⏸ 一時停止";
-  pp.addEventListener("click",()=>{ playing=!playing; pp.textContent=playing?"⏸ 一時停止":"▶ 再生"; if(playing){lastT=0;loop();} });
-  panel.appendChild(pp);
-  const rs=document.createElement("button"); rs.textContent="⟲ リセット";
-  rs.addEventListener("click",()=>{ if(M){api.reset(); frames=0; if(!playing){api.step(0);blit();}} });
-  panel.appendChild(rs);
+  // 押した瞬間に必ず光らせる(押したことが分かるように)
+  const hit=btn=>{ btn.classList.add("hit"); setTimeout(()=>btn.classList.remove("hit"),160); };
+  const mk=(txt,cls)=>{ const b=document.createElement("button"); b.textContent=txt;
+                        if(cls)b.className=cls; panel.appendChild(b); return b; };
+
+  // スターマイン — 実行中は自分が「停止」ボタンになり、進捗も出す
+  btnStar=mk("🎆 スターマイン 連打");
+  btnStar.addEventListener("click",()=>{ if(!M)return; hit(btnStar);
+    api.action(api.get(0)>0 ? 4 : 3); syncButtons(); });
+
+  btnOne=mk("🎇 1発打ち上げ");
+  btnOne.addEventListener("click",()=>{ if(!M)return; hit(btnOne); api.action(0); });
+
+  // 単発の連発 — ON/OFF が見えるトグル
+  btnAuto=mk("⏱ 自動連発");
+  btnAuto.addEventListener("click",()=>{ if(!M)return; hit(btnAuto); api.action(2); syncButtons(); });
+
+  btnPlay=mk("⏸ 一時停止","primary");
+  btnPlay.addEventListener("click",()=>{ playing=!playing;
+    btnPlay.textContent=playing?"⏸ 一時停止":"▶ 再生"; if(playing){lastT=0;loop();} });
+
+  const rs=mk("⟲ リセット");
+  rs.addEventListener("click",()=>{ if(!M)return; hit(rs); api.reset(); frames=0;
+    syncButtons(); if(!playing){api.step(0);blit();} });
+
+  syncButtons();
+}
+
+// C++ 側の状態をボタンの見た目に反映する
+function syncButtons(){
+  if(!M) return;
+  const left=api.get(0), total=api.get(1);
+  if(left>0){
+    btnStar.textContent=`■ 停止  ${total-left}/${total} 発`;
+    btnStar.classList.add("running");
+  }else{
+    btnStar.textContent="🎆 スターマイン 連打";
+    btnStar.classList.remove("running");
+  }
+  const auto=api.get(5)>0.5;
+  btnAuto.textContent = auto ? "⏱ 自動連発: ON" : "⏱ 自動連発: OFF";
+  btnAuto.classList.toggle("on", auto);
 }
 
 function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }
@@ -122,7 +156,11 @@ function loop(ts){
   let n = Math.max(1, Math.min(3, Math.round(lag/16.667)));
   lag = Math.max(0, lag - n*16.667);
   api.step(n); blit(); frames+=n;
-  statusEl.textContent=`frame ${frames}   ${fpsAvg.toFixed(0)} fps   x${n}`;
+  syncButtons();
+  statusEl.textContent =
+    `${fpsAvg.toFixed(0)} fps (x${n})   玉 ${api.get(4)|0} 発上昇中   星 ${api.get(2)|0} 個   ` +
+    `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   引先 ${(api.get(8)*100).toFixed(0)}%   ` +
+    `実測 到達高度 ${api.get(6).toFixed(0)}m / 開花直径 ${api.get(7).toFixed(0)}m`;
   raf=requestAnimationFrame(loop);
 }
 

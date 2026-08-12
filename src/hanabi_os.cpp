@@ -448,6 +448,23 @@ KEEP void sim_set(int id, double v) {
     }
 }
 
+// UI に状態を返す(universe_cpp の共通 ABI への追加分)
+KEEP double sim_get(int id) {
+    switch (id) {
+    case 0: return (double)barLeft;
+    case 1: return (double)barTotal;
+    case 2: return (double)stars.size();
+    case 3: return (double)sparks.size();
+    case 4: return (double)shells.size();
+    case 5: return p_auto ? 1.0 : 0.0;
+    case 6: return measH;
+    case 7: return measD * 2.0;
+    case 8: return qual;
+    case 9: return simTime;
+    }
+    return 0.0;
+}
+
 KEEP void sim_action(int id) {
     if (id == 0) launch(-1000.0);            // 手動で1発
     else if (id == 1) sim_reset();

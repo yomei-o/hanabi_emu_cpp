@@ -9,7 +9,7 @@ NAME="${1:-hanabi_os}"
 mkdir -p "wasmdist/$NAME"
 em++ -O3 -std=c++17 -I. "src/$NAME.cpp" \
   -sMODULARIZE=1 -sEXPORT_NAME=createSim -sENVIRONMENT=web -sALLOW_MEMORY_GROWTH=1 \
-  -sEXPORTED_FUNCTIONS=_sim_init,_sim_w,_sim_h,_sim_reset,_sim_step,_sim_render,_sim_click,_sim_set,_sim_action,_malloc,_free \
+  -sEXPORTED_FUNCTIONS=_sim_init,_sim_w,_sim_h,_sim_reset,_sim_step,_sim_render,_sim_click,_sim_set,_sim_action,_sim_get,_malloc,_free \
   -sEXPORTED_RUNTIME_METHODS=cwrap,HEAPU8 \
   -o "wasmdist/$NAME/sim.js"
 echo "built wasmdist/$NAME/sim.js (+.wasm)"
