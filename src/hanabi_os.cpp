@@ -433,6 +433,34 @@ static void burst(Shell& sh) {
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
                        || sh.type == T_KAMURO || is_shaped(sh.type)) ? 0 : sh.layers);
     bool crackle = (rnd() < 0.20);          // 消え際に分砲(パチパチ)する玉か
+
+    // 型物を並べる平面の向き。玉は飛びながら回っているので、開く向きは制御しきれない。
+    // 観客向き(e1=X, e2=Y)を基準に、玉ごとにランダムな軸まわりにランダムな角度だけ傾ける。
+    // (真横を向くと線にしか見えないので、傾きは最大60度までにとどめてある)
+    double e1x = 1, e1y = 0, e1z = 0, e2x = 0, e2y = 1, e2z = 0, enx = 0, eny = 0, enz = 1;
+    if (is_shaped(sh.type)) {
+        double roll = rnd() * 6.2831853;                    // 面内の回転(絵の傾き)
+        double cr = cos(roll), sr = sin(roll);
+        e1x = cr;  e1y = sr; e1z = 0;
+        e2x = -sr; e2y = cr; e2z = 0;
+        // 傾ける軸(面内のどこか)と傾き角
+        double al = rnd() * 6.2831853, ph = (10.0 + 38.0 * rnd()) * M_PI / 180.0;
+        double kx = cos(al), ky = sin(al), kz = 0.0;        // 回転軸(単位ベクトル)
+        double cp = cos(ph), sp2 = sin(ph);
+        // ロドリゲスの回転公式で 3 本まとめて回す
+        auto rot = [&](double& vx, double& vy, double& vz) {
+            double dotk = kx * vx + ky * vy + kz * vz;
+            double crx = ky * vz - kz * vy, cry = kz * vx - kx * vz, crz = kx * vy - ky * vx;
+            double nx = vx * cp + crx * sp2 + kx * dotk * (1 - cp);
+            double ny = vy * cp + cry * sp2 + ky * dotk * (1 - cp);
+            double nz = vz * cp + crz * sp2 + kz * dotk * (1 - cp);
+            vx = nx; vy = ny; vz = nz;
+        };
+        rot(e1x, e1y, e1z); rot(e2x, e2y, e2z);
+        enx = e1y * e2z - e1z * e2y;                        // 面の法線
+        eny = e1z * e2x - e1x * e2z;
+        enz = e1x * e2y - e1y * e2x;
+    }
     // 玉の中の星は同じ組成なので、回る速さ・落ち方・点火の時期はだいたい揃う。
     // ただし玉に詰められたときの向きはバラバラなので、回転軸と回る向きは星ごとにランダム。
     double gomega = 20.0 + 12.0 * rnd();    // [rad/s] 点火直後の自転(3〜5回転/秒)
@@ -473,13 +501,17 @@ static void burst(Shell& sh) {
             double dx, dy, dz, v;
             int ncore = (sh.type == T_SATURN) ? (n * 38) / 100 : 0;   // 土星の芯の星数
             if (is_shaped(sh.type) && i >= ncore) {
-                // 型物 — 観客を向いた平面に形どおり並べ、中心から距離に比例した速度で押し出す。
-                // 形はそのまま相似に拡大していく(外側ほど速いので抗力で少しだけ崩れる = 実物と同じ)
+                // 型物 — 玉の中の平面に形どおり並べ、中心から距離に比例した速度で押し出す。
+                // 形はそのまま相似に拡大していく(外側ほど速いので抗力で少しだけ崩れる = 実物と同じ)。
+                // 平面の向きは玉ごとにランダムに傾けてある(下の e1/e2/en)
                 double px2, py2;
                 shape_point(sh.type, (double)(i - ncore) / (n - ncore), px2, py2);
                 double rad = sqrt(px2 * px2 + py2 * py2);
                 if (rad < 1e-6) rad = 1e-6;
-                dx = px2 / rad; dy = py2 / rad; dz = rnds() * 0.06;   // 板厚のゆらぎ
+                double a = px2 / rad, b = py2 / rad, c = rnds() * 0.06;   // 板厚のゆらぎ
+                dx = e1x * a + e2x * b + enx * c;
+                dy = e1y * a + e2y * b + eny * c;
+                dz = e1z * a + e2z * b + enz * c;
                 v = s.starV * 0.92 * rad * (1.0 + rnds() * 0.012);
             } else if (ncore > 0 && i < ncore) {
                 // 土星の芯 — こちらは3Dの小さな球
