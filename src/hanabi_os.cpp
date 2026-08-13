@@ -173,14 +173,16 @@ static bool   p_auto = true;
 
 static double p_shots = 100.0;   // スターマインの発数
 static double p_rapid = 0.22;    // 連打間隔 [s]
+static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
 
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
 static long   frameNo = 0;
 
 // スターマイン(早打ち)の状態 — 全部インクリメンタルに減っていく
-static int    barLeft = 0, barTotal = 0;
-static double barTimer = 0.0;
+// barPhase: 0=通常 1=連打中 2=余韻(空が空になるまで待ち、さらに静寂の時間だけ何も上げない)
+static int    barLeft = 0, barTotal = 0, barPhase = 0;
+static double barTimer = 0.0, quietTimer = 0.0;
 
 // 粒子予算に対する負荷から引先の量を自動調整する係数(一次遅れ = 差分式)
 static double qual = 1.0;
@@ -398,6 +400,8 @@ static void launch(double nx) { launch_ex(nx, p_go, 0); }
 static void start_barrage() {
     barTotal = barLeft = (int)(p_shots + 0.5);
     barTimer = 0.0;
+    barPhase = 1;
+    quietTimer = 0.0;
 }
 
 // ---------------------------------------------------------------- ABI
@@ -412,7 +416,7 @@ KEEP void sim_reset() {
     acc.assign((size_t)FW * FH * 3, 0.0f);
     simTime = 0; launchTimer = 0.4; frameNo = 0;
     measH = 0; measD = 0;
-    barLeft = barTotal = 0; barTimer = 0; qual = 1.0;
+    barLeft = barTotal = barPhase = 0; barTimer = 0; quietTimer = 0; qual = 1.0;
     curSpec = spec_of(p_go);
     setup_camera(curSpec);
     build_bg();
@@ -445,6 +449,7 @@ KEEP void sim_set(int id, double v) {
     case 6: p_glow = v; break;
     case 7: p_shots = v; break;
     case 8: p_rapid = v; break;
+    case 9: p_quiet = v; break;
     }
 }
 
@@ -461,6 +466,8 @@ KEEP double sim_get(int id) {
     case 7: return measD * 2.0;
     case 8: return qual;
     case 9: return simTime;
+    case 10: return (double)barPhase;
+    case 11: return quietTimer;
     }
     return 0.0;
 }
@@ -518,8 +525,20 @@ KEEP void sim_step(int frames) {
                 }
             }
 
+            // --- 連打が終わったら余韻。最後の玉が開いて星が燃え尽きるまで待ち、
+            //     空が完全に空になってから静寂の時間を差分で消化する
+            if (barPhase == 1 && barLeft == 0) { barPhase = 2; quietTimer = p_quiet; }
+            if (barPhase == 2) {
+                if (shells.empty() && stars.empty()) {
+                    quietTimer -= dt;
+                    if (quietTimer <= 0.0) { barPhase = 0; launchTimer = p_interval; }
+                } else {
+                    quietTimer = p_quiet;   // まだ空に何か残っている = 余韻はまだ始まらない
+                }
+            }
+
             // --- 通常の打ち上げ間隔
-            if (p_auto && barLeft == 0) {
+            if (p_auto && barPhase == 0) {
                 launchTimer -= dt;
                 if (launchTimer <= 0.0) {
                     double q = rnd();
@@ -672,10 +691,13 @@ KEEP uint8_t* sim_render() {
     snprintf(buf, sizeof(buf), "KIKU %d-GO %.0fmm  lift %.0f  burst %.0f m/s -> H %.0fm  flower %.0fm",
              (int)p_go, curSpec.dia * 1000.0, curSpec.liftV, curSpec.starV, measH, measD * 2.0);
     olivec_text(oc, buf, 14, 12, olivec_default_font, 2, rgb(255, 190, 90));
-    if (barLeft > 0)
+    if (barPhase == 1)
         snprintf(buf, sizeof(buf), "STARMINE %d/%d   stars %d  sparks %d  shells %d  q%.2f",
                  barTotal - barLeft, barTotal, (int)stars.size(), (int)sparks.size(),
                  (int)shells.size(), qual);
+    else if (barPhase == 2)
+        snprintf(buf, sizeof(buf), "... afterglow %.1fs   stars %d  sparks %d  shells %d",
+                 quietTimer, (int)stars.size(), (int)sparks.size(), (int)shells.size());
     else
         snprintf(buf, sizeof(buf), "stars %5d   sparks %6d   shells %d   t=%.1fs",
                  (int)stars.size(), (int)sparks.size(), (int)shells.size(), simTime);
@@ -697,7 +719,13 @@ int main(int argc, char** argv) {
     const char* out = argc > 2 ? argv[2] : "hanabi_preview.png";
     int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
     if (barrage) { sim_set(7, barrage); sim_action(3); }
-    for (int i = 0; i < steps; ++i) { sim_step(1); sim_render(); }   // 毎フレーム描画 = 実負荷
+    for (int i = 0; i < steps; ++i) {
+        sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
+        if (barrage && i % 30 == 0)
+            printf("  t=%5.1fs phase=%d bar=%3d/%-3d quiet=%4.1f shells=%2d stars=%5d sparks=%6d\n",
+                   sim_get(9), (int)sim_get(10), barTotal - barLeft, barTotal, sim_get(11),
+                   (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
+    }
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;
     printf("hanabi_os native: %dx%d  frames=%d  stars=%d sparks=%d  lit=%d\n",

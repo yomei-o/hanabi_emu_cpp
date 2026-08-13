@@ -62,6 +62,7 @@ const CONFIG = {
     { id:6, label:"残光",            min:0.60, max:0.94,step:0.01, val:0.82, dec:2 },
     { id:7, label:"連打の発数",      min:20,   max:300, step:10,   val:100,  dec:0 },
     { id:8, label:"連打間隔 [s]",    min:0.05, max:0.8, step:0.01, val:0.22, dec:2 },
+    { id:9, label:"連打後の余韻 [s]",min:0,    max:20,  step:0.5,  val:6.0,  dec:1 },
   ],
   clickable: true,
   stepsPerFrame: 1,
@@ -108,6 +109,7 @@ function buildPanel(){
 
   // スターマイン — 実行中は自分が「停止」ボタンになり、進捗も出す
   btnStar=mk("🎆 スターマイン 連打");
+  btnStar.title="連打が終わると、空が完全に空になってから余韻(静寂)の時間だけ何も上がりません";
   btnStar.addEventListener("click",()=>{ if(!M)return; hit(btnStar);
     api.action(api.get(0)>0 ? 4 : 3); syncButtons(); });
 
@@ -132,10 +134,16 @@ function buildPanel(){
 // C++ 側の状態をボタンの見た目に反映する
 function syncButtons(){
   if(!M) return;
-  const left=api.get(0), total=api.get(1);
-  if(left>0){
+  const left=api.get(0), total=api.get(1), phase=api.get(10);
+  if(phase===1){
     btnStar.textContent=`■ 停止  ${total-left}/${total} 発`;
     btnStar.classList.add("running");
+  }else if(phase===2){
+    // 余韻中。空が空になってから静寂のカウントダウンが始まる
+    const q=api.get(11);
+    btnStar.textContent = (api.get(2)>0||api.get(4)>0) ? "🌙 余韻…（開いている）"
+                                                      : `🌙 余韻… ${q.toFixed(1)}s`;
+    btnStar.classList.remove("running");
   }else{
     btnStar.textContent="🎆 スターマイン 連打";
     btnStar.classList.remove("running");
@@ -157,7 +165,10 @@ function loop(ts){
   lag = Math.max(0, lag - n*16.667);
   api.step(n); blit(); frames+=n;
   syncButtons();
+  const ph=api.get(10);
   statusEl.textContent =
+    (ph===1 ? `🎆 連打中 ${(api.get(1)-api.get(0))|0}/${api.get(1)|0}   `
+   : ph===2 ? `🌙 余韻   ` : ``) +
     `${fpsAvg.toFixed(0)} fps (x${n})   玉 ${api.get(4)|0} 発上昇中   星 ${api.get(2)|0} 個   ` +
     `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   引先 ${(api.get(8)*100).toFixed(0)}%   ` +
     `実測 到達高度 ${api.get(6).toFixed(0)}m / 開花直径 ${api.get(7).toFixed(0)}m`;
