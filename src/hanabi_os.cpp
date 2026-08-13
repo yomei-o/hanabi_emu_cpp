@@ -234,6 +234,7 @@ static bool   p_auto = true;
 static double p_shots = 100.0;   // スターマインの発数
 static double p_rapid = 0.22;    // 連打間隔 [s]
 static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
+static double p_starInt = 120.0; // 自動スターマインの間隔 [s] (0 で自動なし)
 static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
 static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
 
@@ -245,6 +246,7 @@ static long   frameNo = 0;
 // barPhase: 0=通常 1=連打中 2=余韻(空が空になるまで待ち、さらに静寂の時間だけ何も上げない)
 static int    barLeft = 0, barTotal = 0, barPhase = 0;
 static double barTimer = 0.0, quietTimer = 0.0;
+static double starTimer = 120.0; // 次の自動スターマインまで [s] — 通常時だけ減っていく
 static int    curTheme = 1;      // この連打で実際に使うテーマ(おまかせはここで確定させる)
 
 // 粒子予算に対する負荷から引先の量を自動調整する係数(一次遅れ = 差分式)
@@ -671,6 +673,7 @@ static void start_barrage() {
     barTimer = 0.0;
     barPhase = 1;
     quietTimer = 0.0;
+    starTimer = p_starInt;       // 次の自動打ち上げまでを測り直す
     // おまかせ = 全種類を混ぜるのではなく、テーマを1つ引く(1発ごとではなく連打ごとに確定)
     int ti = (int)(p_theme + 0.5);
     curTheme = (ti <= 0) ? (1 + (int)(rnd() * (THEME_COUNT - 1))) : ti;
@@ -690,6 +693,7 @@ KEEP void sim_reset() {
     simTime = 0; launchTimer = 0.4; frameNo = 0;
     measH = 0; measD = 0;
     barLeft = barTotal = barPhase = 0; barTimer = 0; quietTimer = 0; qual = 1.0;
+    starTimer = p_starInt;
     curSpec = spec_of(p_go);
     setup_camera(curSpec);
     build_bg();
@@ -725,6 +729,12 @@ KEEP void sim_set(int id, double v) {
     case 9: p_quiet = v; break;
     case 10: p_type = v; break;
     case 11: p_theme = v; break;
+    case 12: {                               // 自動スターマインの間隔
+        double old = p_starInt;
+        p_starInt = v;
+        if (v > 0.5 && (old <= 0.5 || starTimer > v)) starTimer = v;
+        break;
+    }
     }
 }
 
@@ -745,6 +755,8 @@ KEEP double sim_get(int id) {
     case 11: return quietTimer;
     case 12: return p_theme;
     case 13: return (double)curTheme;    // この連打で実際に使われているテーマ
+    case 14: return starTimer;           // 次の自動スターマインまで [s]
+    case 15: return p_starInt;
     }
     return 0.0;
 }
@@ -808,6 +820,13 @@ KEEP void sim_step(int frames) {
                 } else {
                     quietTimer = p_quiet;   // まだ空に何か残っている = 余韻はまだ始まらない
                 }
+            }
+
+            // --- 自動スターマイン。単発が上がっている通常時だけ時計が進む
+            //     (連打中と余韻のあいだは止まるので、間隔は「静かな時間」で測られる)
+            if (barPhase == 0 && p_starInt > 0.5) {
+                starTimer -= dt;
+                if (starTimer <= 0.0) start_barrage();
             }
 
             // --- 通常の打ち上げ間隔
@@ -1032,13 +1051,15 @@ int main(int argc, char** argv) {
     int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
     if (argc > 4) sim_set(10, atof(argv[4]));     // 5番目の引数 = 玉の種類(-1でおまかせ)
     if (argc > 5) sim_set(11, atof(argv[5]));     // 6番目の引数 = スターマインのテーマ
+    if (argc > 6) sim_set(12, atof(argv[6]));     // 7番目の引数 = 自動スターマインの間隔
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
-        if (barrage && i % 30 == 0)
-            printf("  t=%5.1fs phase=%d theme=%d bar=%3d/%-3d quiet=%4.1f shells=%2d stars=%5d sparks=%6d\n",
+        if ((barrage || argc > 6) && i % 30 == 0)
+            printf("  t=%5.1fs phase=%d theme=%d bar=%3d/%-3d quiet=%4.1f next=%5.1f "
+                   "shells=%2d stars=%5d sparks=%6d\n",
                    sim_get(9), (int)sim_get(10), (int)sim_get(13), barTotal - barLeft, barTotal,
-                   sim_get(11), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
+                   sim_get(11), sim_get(14), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
     }
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;

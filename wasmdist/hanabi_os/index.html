@@ -42,7 +42,8 @@
     星は燃焼で半径が減るので質量・断面積・弾道係数が刻々変わり、小さくなるほど急減速する — これが菊の形。
     尾(引先)は星から剥がれる燃えかすを実粒子として飛ばしています。<b>到達高度も開花直径も積分の結果</b>で、
     表から読んだ値ではありません。計算も描画もすべて C++ → WASM。クリックでその位置から打ち上げ。<br>
-    <b>🎆 スターマイン</b>を押すと花火大会のクライマックス（既定 100 連発）。星は数千個、火の粉は数十万粒が同時に飛びます。<br>
+    <b>🎆 スターマイン</b>を押すと花火大会のクライマックス（既定 100 連発）。星は数千個、火の粉は数十万粒が同時に飛びます。
+    <b>放っておいても 2 分おきに勝手に始まります</b>（間隔はスライダで変更、0 で自動オフ）。<br>
     玉の種類は<b>菊・牡丹・柳・蜂・千輪・型物（ハート／輪／土星）</b>。見た目を描いているのではなく、
     星に与える物理量（初速・燃焼時間・剥離量・<b>推力とその回転</b>）や配置を変えているだけです。
   </p>
@@ -67,6 +68,7 @@ const CONFIG = {
     { id:7, label:"連打の発数",      min:20,   max:300, step:10,   val:100,  dec:0 },
     { id:8, label:"連打間隔 [s]",    min:0.05, max:0.8, step:0.01, val:0.22, dec:2 },
     { id:9, label:"連打後の余韻 [s]",min:0,    max:20,  step:0.5,  val:6.0,  dec:1 },
+    { id:12,label:"自動スターマイン [s] (0でOFF)", min:0, max:600, step:10, val:120, dec:0 },
   ],
   clickable: true,
   stepsPerFrame: 1,
@@ -173,9 +175,11 @@ function syncButtons(){
                                                       : `🌙 余韻… ${q.toFixed(1)}s`;
     btnStar.classList.remove("running");
   }else{
-    // 待機中は「選んでいるもの」を出す（おまかせなら "おまかせ" のまま）
+    // 待機中は「選んでいるもの」＋次の自動打ち上げまでのカウントダウンを出す
     const th=(THEMES[(api.get(12)|0)]||"").replace(/ —.*$/,"").replace(/（.*）/,"");
-    btnStar.textContent=`🎆 スターマイン ${th}`;
+    const iv=api.get(15), left=Math.max(0,api.get(14));
+    const cd = iv>0.5 ? `  ⏳${Math.floor(left/60)}:${String(Math.floor(left%60)).padStart(2,"0")}` : "";
+    btnStar.textContent=`🎆 スターマイン ${th}${cd}`;
     btnStar.classList.remove("running");
   }
   const auto=api.get(5)>0.5;
