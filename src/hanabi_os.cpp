@@ -190,6 +190,10 @@ enum {
 static inline bool is_shaped(int t) { return t == T_HEART || t == T_RING || t == T_SATURN; }
 struct Flash { double x, y, z; double t, t0, pw; bool alive; };
 
+// 予約発射 — t 秒後に上げる。大玉と小玉は秒時が違うので、同時に「開かせる」には
+// 開発までの時間の差だけ小玉を遅らせて撃つ必要がある(長岡のフェニックスがこれ)
+struct Pending { double t, nx, go, fuseScale, fuseJit; int type, fixc; };
+
 // 位相 phase のときの、中心からのずれと周回による速度を返す
 static void hachi_offset_at(const Star& st, double phase,
                             double& ox, double& oy, double& oz,
@@ -217,6 +221,7 @@ static std::vector<Star>  stars;
 static std::vector<Spark> sparks;
 static std::vector<Shell> shells;
 static std::vector<Flash> flashes;
+static std::vector<Pending> pending;
 
 static std::vector<float>    acc;   // HDR 加算バッファ (RGB)
 static std::vector<uint32_t> px;    // 出力 RGBA
@@ -605,7 +610,8 @@ static void spawn_child(const Shell& p, double dx, double dy, double dz, double 
 
 // nx: 画面内の水平位置 [-1,1] (-1000 でランダム) / go: 号数 / type: 玉の種類(T_*)
 // fixc: 炎色の固定(FIXCOL の添字。-1 で自由)
-static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int fixc = -1) {
+static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int fixc = -1,
+                      double fuseScale = 1.0) {
     if (shells.size() >= 90) return;
     if (go < 3.0) go = 3.0;
     ShellSpec s = spec_of(go);
@@ -618,7 +624,9 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int
     // 打揚薬が与える初速。ここから先は積分するだけ — 到達高度は結果として出る
     sh.vx = rnds() * 1.2; sh.vy = s.liftV * (1.0 + rnds() * 0.02); sh.vz = rnds() * 1.2;
     sh.shed = 0;
-    sh.fuse = s.fuseT * (1.0 + rnds() * fuseJit);   // 時限導火線に点火(秒時のばらつき=開発高度のばらつき)
+    // 時限導火線に点火。秒時のばらつき=開発高度のばらつき。
+    // fuseScale を縮めると頂点まで待たずに低い位置で開く(フェニックスの低い小玉)
+    sh.fuse = s.fuseT * fuseScale * (1.0 + rnds() * fuseJit);
     sh.sp = s;
     sh.type = type;
     sh.gen = 0;
@@ -648,22 +656,29 @@ static int pick_type() {
 // 添字 0 は「おまかせ」= 打ち上げ開始時に 1 以降からランダムに1つ選ぶ(全種類を混ぜはしない)。
 // type: -2=型物からランダム / それ以外は T_* をそのまま
 // fixc: FIXCOL の添字で炎色を固定(-1 で自由)
-struct Theme { int type; int fixc; };
+// layout: 0=通常(掃引しながら1〜3発) / 1=フェニックス(大玉を横一列＋低い小玉を同時開花)
+struct Theme { int type; int fixc; int layout; };
 static const Theme THEMES[] = {
-    { T_KIKU,   -1 },  // 0 おまかせ(実際には下から1つ選ばれる。ここは保険)
-    { T_KIKU,   -1 },  // 1 菊 — 色とりどり
-    { T_KIKU,    0 },  // 2 桜 — ピンクの菊だけ
-    { T_KIKU,    5 },  // 3 銀世界 — 銀の菊だけ
-    { T_BOTAN,  -1 },  // 4 牡丹
-    { T_YANAGI, -1 },  // 5 金の柳
-    { T_HACHI,  -1 },  // 6 蜂
-    { T_UZU,    -1 },  // 7 渦蜂
-    { T_SENRIN, -1 },  // 8 千輪
-    { -2,       -1 },  // 9 型物
-    { T_KAMURO, -1 },  // 10 錦冠(金冠)
+    { T_KIKU,   -1, 0 },  // 0 おまかせ(実際には下から1つ選ばれる。ここは保険)
+    { T_KIKU,   -1, 0 },  // 1 菊 — 色とりどり
+    { T_KIKU,    0, 0 },  // 2 桜 — ピンクの菊だけ
+    { T_KIKU,    5, 0 },  // 3 銀世界 — 銀の菊だけ
+    { T_BOTAN,  -1, 0 },  // 4 牡丹
+    { T_YANAGI, -1, 0 },  // 5 金の柳
+    { T_HACHI,  -1, 0 },  // 6 蜂
+    { T_UZU,    -1, 0 },  // 7 渦蜂
+    { T_SENRIN, -1, 0 },  // 8 千輪
+    { -2,       -1, 0 },  // 9 型物
+    { T_KAMURO, -1, 0 },  // 10 錦冠(金冠)
+    { T_KAMURO,  5, 1 },  // 11 フェニックス — 銀冠の大玉を横一列＋低い小玉を同時に
 };
 static const int THEME_COUNT = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
 
+static int theme_layout() {
+    int ti = curTheme;
+    if (ti < 1) ti = 1; if (ti >= THEME_COUNT) ti = THEME_COUNT - 1;
+    return THEMES[ti].layout;
+}
 static void theme_pick(int& ty, int& fx) {
     int ti = curTheme;
     if (ti < 1) ti = 1; if (ti >= THEME_COUNT) ti = THEME_COUNT - 1;
@@ -675,6 +690,44 @@ static void theme_pick(int& ty, int& fx) {
 static void launch(double nx) { launch_ex(nx, p_go, pick_type()); }
 
 // スターマイン(早打ち) — 発数だけ装填して、あとは連打間隔を差分で消化していく
+static void schedule_launch(double delay, double nx, double go, int type, int fixc,
+                            double fuseScale, double fuseJit) {
+    if (pending.size() >= 600) return;
+    Pending p;
+    p.t = delay; p.nx = nx; p.go = go; p.type = type; p.fixc = fixc;
+    p.fuseScale = fuseScale; p.fuseJit = fuseJit;
+    pending.push_back(p);
+}
+
+// フェニックス(長岡) — 大玉を横一列に、その手前の低い位置に小玉を大量に。
+// 号数が違えば秒時も違うので、開発までの時間差だけ小玉を遅らせて撃ち、空で同時に開かせる。
+static void phoenix_wave(int& budget) {
+    int ty, fx; theme_pick(ty, fx);
+
+    // --- 大玉: 横一列に等間隔。開くタイミングを少しだけずらして「完全な同時」を避ける
+    int nbig = 4 + (int)(rnd() * 3.0);                       // 4〜6発
+    double bigGo = p_go;
+    double bigFuse = spec_of(bigGo).fuseT;
+    for (int i = 0; i < nbig && budget > 0; ++i, --budget) {
+        double x = -0.98 + 1.96 * (i + 0.5) / nbig + rnds() * 0.04;
+        // 号数と秒時を少しずつ変えて、高さと大きさを揃えすぎない
+        double g = (rnd() < 0.32) ? std::max(3.0, bigGo - 2.0) : bigGo;
+        schedule_launch(rnd() * 0.28, x, g, ty, fx, 0.90 + rnd() * 0.18, 0.015);
+    }
+
+    // --- 小玉: うんと低い位置で、大玉と同時に開くように遅らせて予約
+    double smallGo = std::max(3.0, floor(p_go * 0.30 + 0.5));
+    double smallScale = 0.45;                                 // 頂点よりだいぶ手前で開く = 低い
+    double smallFuse = spec_of(smallGo).fuseT * smallScale;
+    double delay = std::max(0.0, bigFuse - smallFuse);        // これで空での開花が揃う
+    int nsmall = 13 + (int)(rnd() * 7.0);                     // 13〜19発
+    for (int i = 0; i < nsmall && budget > 0; ++i, --budget) {
+        double x = -0.97 + 1.94 * (i + 0.5) / nsmall + rnds() * 0.05;
+        int sty = (rnd() < 0.65) ? T_BOTAN : T_KIKU;          // 小玉は尾の短いものを主体に
+        schedule_launch(delay + rnds() * 0.12, x, smallGo, sty, fx, smallScale, 0.02);
+    }
+}
+
 static void start_barrage() {
     barTotal = barLeft = (int)(p_shots + 0.5);
     barTimer = 0.0;
@@ -694,7 +747,7 @@ KEEP int sim_w() { return FW; }
 KEEP int sim_h() { return FH; }
 
 KEEP void sim_reset() {
-    stars.clear(); sparks.clear(); shells.clear(); flashes.clear();
+    stars.clear(); sparks.clear(); shells.clear(); flashes.clear(); pending.clear();
     stars.reserve(20000); sparks.reserve(60000);
     acc.assign((size_t)FW * FH * 3, 0.0f);
     simTime = 0; launchTimer = 0.4; frameNo = 0;
@@ -796,7 +849,24 @@ KEEP void sim_step(int frames) {
             }
 
             // --- スターマイン(早打ち連打)
-            if (barLeft > 0) {
+            // --- 予約発射(フェニックスの小玉など)。これも差分で焼いていくだけ
+            for (size_t i = 0; i < pending.size();) {
+                pending[i].t -= dt;
+                if (pending[i].t <= 0.0) {
+                    Pending p = pending[i];
+                    pending[i] = pending.back(); pending.pop_back();
+                    launch_ex(p.nx, p.go, p.type, p.fuseJit, p.fixc, p.fuseScale);
+                } else ++i;
+            }
+
+            if (barLeft > 0 && theme_layout() == 1) {
+                // フェニックス — ウェーブ単位で大玉＋小玉をまとめて
+                barTimer -= dt;
+                if (barTimer <= 0.0) {
+                    phoenix_wave(barLeft);
+                    barTimer = 2.2 + rnd() * 1.0;
+                }
+            } else if (barLeft > 0) {
                 barTimer -= dt;
                 if (barTimer <= 0.0) {
                     int volley = 1 + (int)(rnd() * 2.7);          // 1〜3発同時に上がる
@@ -822,7 +892,7 @@ KEEP void sim_step(int frames) {
             //     空が完全に空になってから静寂の時間を差分で消化する
             if (barPhase == 1 && barLeft == 0) { barPhase = 2; quietTimer = p_quiet; }
             if (barPhase == 2) {
-                if (shells.empty() && stars.empty()) {
+                if (shells.empty() && stars.empty() && pending.empty()) {
                     quietTimer -= dt;
                     if (quietTimer <= 0.0) { barPhase = 0; launchTimer = p_interval; }
                 } else {
@@ -1063,6 +1133,7 @@ int main(int argc, char** argv) {
     if (argc > 5) sim_set(11, atof(argv[5]));     // 6番目の引数 = スターマインのテーマ
     if (argc > 6) sim_set(12, atof(argv[6]));     // 7番目の引数 = 自動スターマインの間隔
     if (argc > 7) sim_set(13, atof(argv[7]));     // 8番目の引数 = 0 で HUD の文字を消す
+    if (argc > 8) sim_set(0,  atof(argv[8]));     // 9番目の引数 = 号数
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
