@@ -184,6 +184,7 @@ enum {
     T_HEART,      // 型物   — ハート
     T_RING,       // 型物   — 輪
     T_SATURN,     // 型物   — 土星(芯＋傾いた輪)
+    T_KAMURO,     // 錦冠   — 柳の親玉。10秒級の長燃焼で地面近くまで垂れ、消え際だけ紅くなる
     T_COUNT
 };
 static inline bool is_shaped(int t) { return t == T_HEART || t == T_RING || t == T_SATURN; }
@@ -435,8 +436,10 @@ static void burst(Shell& sh) {
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
     if (sh.type == T_UZU)    { tv = 0.90; tb = 0.34; tshed = 3.60; tthrust = 2.0; }  // 渦蜂
     if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
+    // 錦冠(金冠) — 柳をうんと強くしたもの。低速・超長燃焼で地面近くまで垂れる
+    if (sh.type == T_KAMURO) { tv = 0.40; tb = 2.30; tshed = 2.20; }
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
-                       || is_shaped(sh.type)) ? 0 : sh.layers);
+                       || sh.type == T_KAMURO || is_shaped(sh.type)) ? 0 : sh.layers);
     bool crackle = (rnd() < 0.20);          // 消え際に分砲(パチパチ)する玉か
     // 渦蜂は回転軸を玉全体で共有する。これで全部の星が同じ向きに大きな渦を巻く
     double gax = rnds(), gay = rnds(), gaz = rnds();
@@ -466,6 +469,8 @@ static void burst(Shell& sh) {
         if (sh.type == T_YANAGI) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
         if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.4f; tail = C_GOLD; }
         if (sh.type == T_UZU)    { c0 = C_SILVER; c1 = C_GOLD; chg = 0.3f; tail = C_GOLD; }
+        // 菊先紅 — 燃焼の最後の1割だけ紅に変わる。錦冠の見せ場
+        if (sh.type == T_KAMURO) { c0 = C_GOLD; c1 = C_RED; chg = 0.90f; tail = C_GOLD; }
         if (is_shaped(sh.type))  { c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.25f); }
         // テーマで炎色を固定する場合(例: 桜 = ピンクの菊だけ)
         if (sh.fixc >= 0) {
@@ -655,6 +660,7 @@ static const Theme THEMES[] = {
     { T_UZU,    -1 },  // 7 渦蜂
     { T_SENRIN, -1 },  // 8 千輪
     { -2,       -1 },  // 9 型物
+    { T_KAMURO, -1 },  // 10 錦冠(金冠)
 };
 static const int THEME_COUNT = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
 
@@ -1062,9 +1068,10 @@ int main(int argc, char** argv) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
         if ((barrage || argc > 6) && i % 30 == 0)
             printf("  t=%5.1fs phase=%d theme=%d bar=%3d/%-3d quiet=%4.1f next=%5.1f "
-                   "shells=%2d stars=%5d sparks=%6d\n",
+                   "shells=%2d stars=%5d sparks=%6d q=%.2f\n",
                    sim_get(9), (int)sim_get(10), (int)sim_get(13), barTotal - barLeft, barTotal,
-                   sim_get(11), sim_get(14), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
+                   sim_get(11), sim_get(14), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3),
+                   sim_get(8));
     }
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;
