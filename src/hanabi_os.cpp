@@ -189,15 +189,16 @@ enum {
 static inline bool is_shaped(int t) { return t == T_HEART || t == T_RING || t == T_SATURN; }
 struct Flash { double x, y, z; double t, t0, pw; bool alive; };
 
-// 中心からのずれと、周回による速度を返す
-static void hachi_offset(const Star& st, double& ox, double& oy, double& oz,
-                         double& ovx, double& ovy, double& ovz) {
+// 位相 phase のときの、中心からのずれと周回による速度を返す
+static void hachi_offset_at(const Star& st, double phase,
+                            double& ox, double& oy, double& oz,
+                            double& ovx, double& ovy, double& ovz) {
     double w = st.spin;
     double aw = fabs(w);
     if (aw < 0.5) aw = 0.5;
     double R = st.thrust * (st.r / st.r0) / (aw * aw);
     if (R > 22.0) R = 22.0;                       // 回転が落ちきっても暴れないように
-    double cs = cos(st.sphase), sn = sin(st.sphase);
+    double cs = cos(phase), sn = sin(phase);
     ox = R * (st.ux * cs + st.wx * sn);
     oy = R * (st.uy * cs + st.wy * sn);
     oz = R * (st.uz * cs + st.wz * sn);
@@ -205,6 +206,10 @@ static void hachi_offset(const Star& st, double& ox, double& oy, double& oz,
     ovx = R * w * (-st.ux * sn + st.wx * cs);
     ovy = R * w * (-st.uy * sn + st.wy * cs);
     ovz = R * w * (-st.uz * sn + st.wz * cs);
+}
+static void hachi_offset(const Star& st, double& ox, double& oy, double& oz,
+                         double& ovx, double& ovy, double& ovz) {
+    hachi_offset_at(st, st.sphase, ox, oy, oz, ovx, ovy, ovz);
 }
 
 static std::vector<Star>  stars;
@@ -425,7 +430,7 @@ static void burst(Shell& sh) {
     if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
     // 蜂の類は推進薬を推力と回転に使い切るので、燃焼は短い(1.5〜2秒)。光る時間も短い
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
-    if (sh.type == T_UZU)    { tv = 0.90; tb = 0.34; tshed = 1.60; tthrust = 2.0; }  // 渦蜂
+    if (sh.type == T_UZU)    { tv = 0.90; tb = 0.34; tshed = 3.60; tthrust = 2.0; }  // 渦蜂
     if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
                        || is_shaped(sh.type)) ? 0 : sh.layers);
@@ -436,8 +441,8 @@ static void burst(Shell& sh) {
     if (gal < 1e-6) { gax = 0; gay = 1; gaz = 0; gal = 1; }
     gax /= gal; gay /= gal; gaz /= gal;
     double gsign = (rnd() < 0.5) ? -1.0 : 1.0;
-    double gomega = 26.0 + 14.0 * rnd();    // [rad/s] 点火直後の回転(4〜6回転/秒)
-    double gdamp  = 0.16 + 0.10 * rnd();    // 回転の落ち方
+    double gomega = 42.0 + 26.0 * rnd();    // [rad/s] 点火直後の回転(7〜11回転/秒)
+    double gdamp  = 0.09 + 0.05 * rnd();    // 回転の落ち方(ゆっくり落とすと何周も巻く)
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
         // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
@@ -545,7 +550,7 @@ static void burst(Shell& sh) {
                 if (uzu) {
                     // 渦蜂 — 半径 R = 推力/ω^2。点火直後は速く回るので輪は小さく、
                     // 回転が落ちるにつれて輪が開いていく。回転にエネルギーを使うので短命
-                    st.thrust = (float)(280.0 + 220.0 * rnd());
+                    st.thrust = (float)(900.0 + 600.0 * rnd());
                     st.spin   = (float)(gsign * gomega * (1.0 + rnds() * 0.10)); // 向きも速さも揃える
                     st.spinB  = (float)(gdamp * (1.0 + rnds() * 0.15));
                 } else {
@@ -849,6 +854,7 @@ KEEP void sim_step(int frames) {
                 double vrx = st.vx - p_wind, vry = st.vy, vrz = st.vz;
                 double sp = sqrt(vrx * vrx + vry * vry + vrz * vrz);
                 double ax = -k * sp * vrx, ay = -k * sp * vry - G_ACC, az = -k * sp * vrz;
+                double sph0 = st.sphase;      // このサブステップの開始位相(火の粉の補間に使う)
                 if (st.thrust > 0.0f) {
                     // 回転は空気抵抗で落ちていく: dω/dt = -B|ω|ω (これも差分)
                     st.spin -= st.spinB * fabsf(st.spin) * st.spin * (float)dt;
@@ -887,11 +893,18 @@ KEEP void sim_step(int frames) {
                 st.shed += st.shedRate * qual * dt;
                 if (st.shed >= 1.0) {
                     // 渦蜂は中心のまわりを回っているので、火の粉は周回中の位置から
-                    // 接線方向の速度を持って剥がれる(これが渦の軌跡になる)
+                    // 接線方向の速度を持って剥がれる(これが渦の軌跡になる)。
+                    // 回転が速いと 1 サブステップで位相がかなり進むので、
+                    // このサブステップ内の円弧上に分けて撒かないと軌跡が点線になる
+                    int nsh = (int)st.shed;
                     double ox = 0, oy = 0, oz = 0, ovx = 0, ovy = 0, ovz = 0;
-                    if (st.orbit) hachi_offset(st, ox, oy, oz, ovx, ovy, ovz);
-                    while (st.shed >= 1.0) {
+                    for (int q = 0; q < nsh; ++q) {
                         st.shed -= 1.0;
+                        if (st.orbit) {
+                            double f = (q + 0.5) / nsh;
+                            hachi_offset_at(st, sph0 + (st.sphase - sph0) * f,
+                                            ox, oy, oz, ovx, ovy, ovz);
+                        }
                         emit_spark(st.x + ox, st.y + oy, st.z + oz,
                                    (st.vx + ovx) * 0.12 + rnds() * 2.0,
                                    (st.vy + ovy) * 0.12 + rnds() * 2.0,
