@@ -17,6 +17,8 @@
   .ctl{ display:flex; flex-direction:column; font-size:11px; color:#c08a52; min-width:150px; }
   .ctl b{ color:var(--fg); }
   input[type=range]{ accent-color:var(--fg); }
+  select{ font-family:inherit; font-size:12px; margin-top:3px; padding:4px 6px; border-radius:5px;
+          background:#201408; color:var(--fg); border:1px solid #a63; }
   button{ font-family:inherit; font-size:13px; padding:7px 13px; border:1px solid #a63; border-radius:6px;
           background:#201408; color:var(--fg); cursor:pointer; transition:background .12s, box-shadow .12s;
           min-width:170px; }
@@ -40,7 +42,9 @@
     星は燃焼で半径が減るので質量・断面積・弾道係数が刻々変わり、小さくなるほど急減速する — これが菊の形。
     尾(引先)は星から剥がれる燃えかすを実粒子として飛ばしています。<b>到達高度も開花直径も積分の結果</b>で、
     表から読んだ値ではありません。計算も描画もすべて C++ → WASM。クリックでその位置から打ち上げ。<br>
-    <b>🎆 スターマイン</b>を押すと花火大会のクライマックス（既定 100 連発）。星は数千個、火の粉は数十万粒が同時に飛びます。
+    <b>🎆 スターマイン</b>を押すと花火大会のクライマックス（既定 100 連発）。星は数千個、火の粉は数十万粒が同時に飛びます。<br>
+    玉の種類は<b>菊・牡丹・柳・蜂・千輪・型物（ハート／輪／土星）</b>。見た目を描いているのではなく、
+    星に与える物理量（初速・燃焼時間・剥離量・<b>推力とその回転</b>）や配置を変えているだけです。
   </p>
   <canvas id="cv"></canvas>
   <div id="panel"></div>
@@ -94,6 +98,19 @@ createSim().then(mod=>{
 });
 
 function buildPanel(){
+  // 玉の種類
+  {
+    const wrap=document.createElement("label"); wrap.className="ctl"; wrap.style.minWidth="190px";
+    const head=document.createElement("span"); head.innerHTML="玉の種類";
+    const sel=document.createElement("select");
+    [["-1","🎲 おまかせ"],["0","菊 — 長い引先"],["1","牡丹 — 尾なし"],["2","柳 — 垂れ下がる"],
+     ["3","蜂 — クルクル回る"],["4","千輪 — 子玉が一斉に開く"],["5","型物 ハート"],
+     ["6","型物 輪"],["7","型物 土星"]].forEach(([v,t])=>{
+      const o=document.createElement("option"); o.value=v; o.textContent=t; sel.appendChild(o); });
+    sel.value="-1";
+    sel.addEventListener("change",()=>{ if(M)api.set(10,+sel.value); });
+    wrap.appendChild(head); wrap.appendChild(sel); panel.appendChild(wrap);
+  }
   CONFIG.sliders.forEach(s=>{
     const wrap=document.createElement("label"); wrap.className="ctl";
     const head=document.createElement("span"); head.innerHTML=`${s.label} <b id="v${s.id}">${(+s.val).toFixed(s.dec)}</b>`;

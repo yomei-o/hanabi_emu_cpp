@@ -130,7 +130,15 @@ struct Star {
     float chg;             // 色が変わる燃焼進行度 (1.0 なら変化なし)
     Col tail;              // 引先(尾)の色
     float shedRate;        // [個/s]
-    bool alive;
+    // --- 蜂(ハチ): ノズルの推力ベクトルが軸まわりに回る ---
+    float ux, uy, uz;      // 推力が回る平面の基底 u
+    float wx, wy, wz;      //                        w  (u ⊥ w ⊥ 回転軸)
+    float thrust;          // 推力による加速度 [m/s^2] (0 なら普通の星)
+    float spin;            // 回転角速度 [rad/s]
+    float sphase;          // 現在の位相 [rad]
+    float delay;           // 暗飛行(点火までの時間)[s] — 飛んではいるが光らない
+    bool  crackle;         // 消え際に分砲(パチパチ)する星か
+    bool  alive;
 };
 struct Spark {
     float x, y, z, vx, vy, vz;
@@ -147,9 +155,24 @@ struct Shell {
     ShellSpec sp;
     int layers;
     int scheme;
-    int type;              // 0=菊 1=牡丹(尾なし) 2=柳(低速・長燃焼)
+    int type;              // 玉の種類(下の enum)
+    int gen;               // 世代 (0=親玉, 1=千輪の子玉)
     bool alive;
 };
+
+// 玉の種類。見た目を直接描くのではなく、星に与える物理量を変えているだけ。
+enum {
+    T_KIKU = 0,   // 菊     — 引先を長く曳く。基本形
+    T_BOTAN,      // 牡丹   — 尾なし。点の集まりで開く
+    T_YANAGI,     // 柳     — 低速・長燃焼で垂れ下がる
+    T_HACHI,      // 蜂     — 星が自分で推力を出し、その向きが回る = クルクル飛ぶ
+    T_SENRIN,     // 千輪   — 子玉を撒き、少し遅れて一斉に小さく開く
+    T_HEART,      // 型物   — ハート
+    T_RING,       // 型物   — 輪
+    T_SATURN,     // 型物   — 土星(芯＋傾いた輪)
+    T_COUNT
+};
+static inline bool is_shaped(int t) { return t == T_HEART || t == T_RING || t == T_SATURN; }
 struct Flash { double x, y, z; double t, t0, pw; bool alive; };
 
 static std::vector<Star>  stars;
@@ -174,6 +197,7 @@ static bool   p_auto = true;
 static double p_shots = 100.0;   // スターマインの発数
 static double p_rapid = 0.22;    // 連打間隔 [s]
 static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
+static double p_type = -1.0;     // 玉の種類 (-1 = おまかせ)
 
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
@@ -313,16 +337,64 @@ static void emit_spark(double x, double y, double z, double vx, double vy, doubl
     sparks.push_back(s);
 }
 
+// 型物の輪郭。u∈[0,1) を受けて、観客を向いた平面上の点(半径1に正規化)を返す
+static void shape_point(int type, double u, double& sx, double& sy) {
+    double t = u * 6.2831853;
+    if (type == T_HEART) {
+        double s3 = sin(t);
+        sx = 16.0 * s3 * s3 * s3;
+        sy = 13.0 * cos(t) - 5.0 * cos(2 * t) - 2.0 * cos(3 * t) - cos(4 * t);
+        sx /= 17.0; sy /= 17.0;
+    } else if (type == T_RING) {
+        sx = cos(t); sy = sin(t);
+    } else {                       // 土星の輪 — 寝かせて傾ける(芯は burst 側で3Dの球にする)
+        double rx = cos(t), ry = sin(t) * 0.26;
+        const double ti = 0.30;
+        sx = rx * cos(ti) - ry * sin(ti);
+        sy = rx * sin(ti) + ry * cos(ti);
+    }
+}
+
+static void spawn_child(const Shell& p, double dx, double dy, double dz, double v,
+                        double go, double fuse, int type);
+
 static void burst(Shell& sh) {
     const ShellSpec& s = sh.sp;
-    // 玉種による味付け。物理量(初速・燃焼時間・剥離量)を変えるだけで見た目は勝手に変わる
-    double tv = 1.0, tb = 1.0, tshed = 1.0;
-    if (sh.type == 1) { tv = 1.10; tb = 0.75; tshed = 0.0;  }   // 牡丹 — 尾を引かない
-    if (sh.type == 2) { tv = 0.48; tb = 1.95; tshed = 1.7;  }   // 柳   — 低速で長く燃え、垂れる
-    int layers = 1 + (sh.type == 2 ? 0 : sh.layers);            // 柳に芯は入れない
+
+    // 千輪 — 星ではなく子玉を撒く。子玉は短い秒時で、少し遅れて一斉に小さく開く
+    if (sh.type == T_SENRIN) {
+        int nc = (int)(9.0 + 4.0 * s.go);
+        double cgo = std::max(1.4, s.go * 0.26);
+        for (int i = 0; i < nc; ++i) {
+            double yy = 1.0 - 2.0 * (i + 0.5) / nc;
+            double rr = sqrt(std::max(0.0, 1.0 - yy * yy));
+            double ph = i * 2.39996322973 + rnd();
+            spawn_child(sh, rr * cos(ph), yy, rr * sin(ph),
+                        s.starV * 0.85 * (1.0 + rnds() * 0.06), cgo,
+                        1.45 + rnd() * 0.55, rnd() < 0.5 ? T_BOTAN : T_KIKU);
+        }
+        if (flashes.size() < 64) {
+            Flash f; f.x = sh.x; f.y = sh.y; f.z = sh.z;
+            f.t0 = f.t = 0.10; f.pw = 3.2 * s.go; f.alive = true;
+            flashes.push_back(f);
+        }
+        sh.alive = false;
+        return;
+    }
+
+    // 玉種による味付け。物理量(初速・燃焼時間・剥離量・推力)を変えるだけで見た目は勝手に変わる
+    double tv = 1.0, tb = 1.0, tshed = 1.0, tthrust = 0.0;
+    if (sh.type == T_BOTAN)  { tv = 1.10; tb = 0.75; tshed = 0.0; }   // 牡丹 — 尾を引かない
+    if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
+    if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
+    if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
+    int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || is_shaped(sh.type)) ? 0 : sh.layers);
+    bool crackle = (rnd() < 0.20);          // 消え際に分砲(パチパチ)する玉か
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
-        int n = (int)(s.nstar * p_density * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
+        // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
+        double tn = (sh.type == T_HACHI) ? 0.38 : 1.0;
+        int n = (int)(s.nstar * p_density * tn * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
         if (n < 8) n = 8;
         if (stars.size() + n > MAX_STARS) n = (int)(MAX_STARS - std::min(MAX_STARS, stars.size()));
         if (n <= 0) break;
@@ -335,21 +407,43 @@ static void burst(Shell& sh) {
         double ca1 = cos(a1), sa1 = sin(a1), ca2 = cos(a2), sa2 = sin(a2);
         double rstar = s.starR * (L == 0 ? 1.0 : 0.82);
         double burnT = s.burnT * (L == 0 ? 1.0 : 0.8) * tb;
-        if (sh.type == 2) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
+        if (sh.type == T_YANAGI) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
+        if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.4f; tail = C_GOLD; }
+        if (is_shaped(sh.type))  { c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.25f); }
 
         for (int i = 0; i < n; ++i) {
-            double yy = 1.0 - 2.0 * (i + 0.5) / n;
-            double rr = sqrt(std::max(0.0, 1.0 - yy * yy));
-            double ph = i * 2.39996322973;
-            double dx = rr * cos(ph), dy = yy, dz = rr * sin(ph);
-            // 微小な向きの揺らぎ(玉込めの誤差)
-            dx += rnds() * 0.02; dy += rnds() * 0.02; dz += rnds() * 0.02;
-            double t;
-            t = dy * ca1 - dz * sa1; dz = dy * sa1 + dz * ca1; dy = t;   // X 回転
-            t = dx * ca2 - dz * sa2; dz = dx * sa2 + dz * ca2; dx = t;   // Y 回転
-            double dl = sqrt(dx * dx + dy * dy + dz * dz); dx /= dl; dy /= dl; dz /= dl;
+            double dx, dy, dz, v;
+            int ncore = (sh.type == T_SATURN) ? (n * 38) / 100 : 0;   // 土星の芯の星数
+            if (is_shaped(sh.type) && i >= ncore) {
+                // 型物 — 観客を向いた平面に形どおり並べ、中心から距離に比例した速度で押し出す。
+                // 形はそのまま相似に拡大していく(外側ほど速いので抗力で少しだけ崩れる = 実物と同じ)
+                double px2, py2;
+                shape_point(sh.type, (double)(i - ncore) / (n - ncore), px2, py2);
+                double rad = sqrt(px2 * px2 + py2 * py2);
+                if (rad < 1e-6) rad = 1e-6;
+                dx = px2 / rad; dy = py2 / rad; dz = rnds() * 0.06;   // 板厚のゆらぎ
+                v = s.starV * 0.92 * rad * (1.0 + rnds() * 0.012);
+            } else if (ncore > 0 && i < ncore) {
+                // 土星の芯 — こちらは3Dの小さな球
+                double yy = 1.0 - 2.0 * (i + 0.5) / ncore;
+                double rr = sqrt(std::max(0.0, 1.0 - yy * yy));
+                double ph = i * 2.39996322973;
+                dx = rr * cos(ph); dy = yy; dz = rr * sin(ph);
+                v = s.starV * 0.26 * (1.0 + rnds() * 0.05);
+            } else {
+                double yy = 1.0 - 2.0 * (i + 0.5) / n;
+                double rr = sqrt(std::max(0.0, 1.0 - yy * yy));
+                double ph = i * 2.39996322973;
+                dx = rr * cos(ph); dy = yy; dz = rr * sin(ph);
+                // 微小な向きの揺らぎ(玉込めの誤差)
+                dx += rnds() * 0.02; dy += rnds() * 0.02; dz += rnds() * 0.02;
+                double t;
+                t = dy * ca1 - dz * sa1; dz = dy * sa1 + dz * ca1; dy = t;   // X 回転
+                t = dx * ca2 - dz * sa2; dz = dx * sa2 + dz * ca2; dx = t;   // Y 回転
+                double dl = sqrt(dx * dx + dy * dy + dz * dz); dx /= dl; dy /= dl; dz /= dl;
+                v = s.starV * vscale * tv * (1.0 + rnds() * 0.035);
+            }
 
-            double v = s.starV * vscale * tv * (1.0 + rnds() * 0.035);
             Star st;
             st.x = sh.x; st.y = sh.y; st.z = sh.z;
             st.bx = (float)sh.x; st.by = (float)sh.y; st.bz = (float)sh.z;
@@ -357,8 +451,39 @@ static void burst(Shell& sh) {
             st.r0 = st.r = rstar * (1.0 + rnds() * 0.04);
             st.dr = st.r0 / (burnT * (1.0 + rnds() * 0.06));
             st.shed = rnd();
-            st.c0 = c0; st.c1 = c1; st.chg = chg; st.tail = tail;
+            if (ncore > 0 && i < ncore) {        // 土星の芯だけ銀色にして輪と区別する
+                st.c0 = C_SILVER; st.c1 = C_SILVER; st.chg = 1.0f;
+                st.tail = mixc(C_SILVER, C_GOLD, 0.4f);
+            } else {
+                st.c0 = c0; st.c1 = c1; st.chg = chg; st.tail = tail;
+            }
             st.shedRate = (float)(115.0 * p_shed * tshed);
+            st.delay = (L == 0) ? 0.0f : (float)(0.10 + 0.16 * L);   // 芯は少し遅れて点火(時差開発)
+            st.crackle = crackle;
+            st.thrust = 0.0f; st.spin = 0.0f; st.sphase = 0.0f;
+            st.ux = st.uy = st.uz = st.wx = st.wy = st.wz = 0.0f;
+
+            if (tthrust > 0.0) {
+                // 蜂 — 星が自分で推力を出し、その向きが軸まわりに回る。
+                // 推力方向 = u cos(θ) + w sin(θ),  θ += spin*dt
+                // 回転が速いと推力が打ち消し合ってブルブル、遅いと大きな輪を描く
+                double axx = rnds(), axy = rnds(), axz = rnds();
+                double al = sqrt(axx * axx + axy * axy + axz * axz);
+                if (al < 1e-6) { axx = 0; axy = 1; axz = 0; al = 1; }
+                axx /= al; axy /= al; axz /= al;
+                double tx = (fabs(axx) < 0.9) ? 1.0 : 0.0, ty = (fabs(axx) < 0.9) ? 0.0 : 1.0;
+                double ux = axy * 0.0 - axz * ty, uy = axz * tx - axx * 0.0, uz = axx * ty - axy * tx;
+                double ul = sqrt(ux * ux + uy * uy + uz * uz);
+                ux /= ul; uy /= ul; uz /= ul;
+                double wx = axy * uz - axz * uy, wy = axz * ux - axx * uz, wz = axx * uy - axy * ux;
+                st.ux = (float)ux; st.uy = (float)uy; st.uz = (float)uz;
+                st.wx = (float)wx; st.wy = (float)wy; st.wz = (float)wz;
+                // 回転が速すぎると推力が打ち消し合ってブルブルするだけになる。
+                // 0.1〜1回転/秒 くらいにすると、はっきりした輪を描いて飛ぶ
+                st.thrust = (float)(45.0 + 60.0 * rnd());      // [m/s^2]
+                st.spin   = (float)((0.7 + 5.5 * rnd()) * (rnd() < 0.5 ? -1.0 : 1.0)); // [rad/s]
+                st.sphase = (float)(rnd() * 6.2831853);
+            }
             st.alive = true;
             stars.push_back(st);
         }
@@ -371,7 +496,27 @@ static void burst(Shell& sh) {
     sh.alive = false;
 }
 
-// nx: 画面内の水平位置 [-1,1] (-1000 でランダム) / go: 号数 / type: 0=菊 1=牡丹 2=柳
+// 千輪の子玉 — 親の開発点から飛び出し、短い秒時で小さく開く
+static void spawn_child(const Shell& p, double dx, double dy, double dz, double v,
+                        double go, double fuse, int type) {
+    if (shells.size() >= 400) return;
+    ShellSpec s = spec_of(go);
+    Shell c;
+    c.x = p.x; c.y = p.y; c.z = p.z;
+    c.vx = p.vx + dx * v; c.vy = p.vy + dy * v; c.vz = p.vz + dz * v;
+    c.k = 0.5 * RHO_AIR * CD * (M_PI * s.dia * s.dia * 0.25) / s.mass;
+    c.shed = 0;
+    c.fuse = fuse;
+    c.sp = s;
+    c.type = type;
+    c.layers = 0;
+    c.scheme = (rnd() < 0.5) ? 0 : 1;
+    c.gen = p.gen + 1;
+    c.alive = true;
+    shells.push_back(c);
+}
+
+// nx: 画面内の水平位置 [-1,1] (-1000 でランダム) / go: 号数 / type: 玉の種類(T_*)
 static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
     if (shells.size() >= 90) return;
     if (go < 3.0) go = 3.0;
@@ -388,13 +533,41 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
     sh.fuse = s.fuseT * (1.0 + rnds() * fuseJit);   // 時限導火線に点火(秒時のばらつき=開発高度のばらつき)
     sh.sp = s;
     sh.type = type;
+    sh.gen = 0;
     sh.layers = (int)(p_layers + 0.5);
     double q = rnd();
     sh.scheme = (sh.layers > 0 && q < 0.30) ? 3 : (q < 0.55 ? 0 : (q < 0.85 ? 1 : 2));
+    if (is_shaped(type)) sh.scheme = 1;              // 型物は形が読めるよう単色に
     sh.alive = true;
     shells.push_back(sh);
 }
-static void launch(double nx) { launch_ex(nx, p_go, 0); }
+// p_type が -1(おまかせ)なら重み付きでランダムに選ぶ
+static int pick_type() {
+    if (p_type >= 0) return (int)(p_type + 0.5);
+    double q = rnd();
+    if (q < 0.34) return T_KIKU;
+    if (q < 0.46) return T_BOTAN;
+    if (q < 0.58) return T_YANAGI;
+    if (q < 0.70) return T_HACHI;
+    if (q < 0.82) return T_SENRIN;
+    if (q < 0.88) return T_HEART;
+    if (q < 0.94) return T_RING;
+    return T_SATURN;
+}
+// 連打では千輪や型物は控えめに(子玉が増えすぎるし、形は単発でこそ映える)
+static int pick_type_barrage() {
+    if (p_type >= 0) return (int)(p_type + 0.5);
+    double q = rnd();
+    if (q < 0.46) return T_KIKU;
+    if (q < 0.64) return T_BOTAN;
+    if (q < 0.74) return T_YANAGI;
+    if (q < 0.87) return T_HACHI;
+    if (q < 0.93) return T_SENRIN;
+    if (q < 0.96) return T_HEART;
+    if (q < 0.98) return T_RING;
+    return T_SATURN;
+}
+static void launch(double nx) { launch_ex(nx, p_go, pick_type()); }
 
 // スターマイン(早打ち) — 発数だけ装填して、あとは連打間隔を差分で消化していく
 static void start_barrage() {
@@ -450,6 +623,7 @@ KEEP void sim_set(int id, double v) {
     case 7: p_shots = v; break;
     case 8: p_rapid = v; break;
     case 9: p_quiet = v; break;
+    case 10: p_type = v; break;
     }
 }
 
@@ -505,13 +679,12 @@ KEEP void sim_step(int frames) {
                     int volley = 1 + (int)(rnd() * 2.7);          // 1〜3発同時に上がる
                     for (int v = 0; v < volley && barLeft > 0; ++v) {
                         bool last = (barLeft == 1);
-                        double go, ty;
-                        if (last) { go = p_go; ty = 0; }                       // 締めは大玉の菊
-                        else if (rnd() < 0.12) { go = p_go; ty = (rnd() < 0.35) ? 2 : 0; }
+                        double go; int ty;
+                        if (last) { go = p_go; ty = (p_type >= 0) ? (int)p_type : T_KIKU; }  // 締めは大玉の菊
+                        else if (rnd() < 0.12) { go = p_go; ty = pick_type_barrage(); }
                         else {
                             go = floor(p_go * (0.45 + 0.50 * rnd()) + 0.5);    // 小玉主体の早打ち
-                            double q = rnd();
-                            ty = (q < 0.62) ? 0 : (q < 0.85 ? 1 : 2);
+                            ty = pick_type_barrage();
                         }
                         // 左右に掃引しながら上げる(実際のスターマインの並び)
                         double prog = 1.0 - (double)barLeft / (double)barTotal;
@@ -541,8 +714,7 @@ KEEP void sim_step(int frames) {
             if (p_auto && barPhase == 0) {
                 launchTimer -= dt;
                 if (launchTimer <= 0.0) {
-                    double q = rnd();
-                    launch_ex(-1000.0, p_go, q < 0.72 ? 0 : (q < 0.9 ? 1 : 2));
+                    launch_ex(-1000.0, p_go, pick_type());
                     launchTimer = p_interval * (0.75 + 0.5 * rnd());
                 }
             }
@@ -558,7 +730,7 @@ KEEP void sim_step(int frames) {
                 sh.vz += (-sh.k * sp * vrz) * dt;
                 sh.x += sh.vx * dt; sh.y += sh.vy * dt; sh.z += sh.vz * dt;
                 // 昇り曲導
-                sh.shed += 150.0 * p_shed * qual * dt;
+                sh.shed += 150.0 * p_shed * qual * (sh.gen ? 0.30 : 1.0) * dt;
                 while (sh.shed >= 1.0) {
                     sh.shed -= 1.0;
                     emit_spark(sh.x, sh.y, sh.z,
@@ -567,7 +739,8 @@ KEEP void sim_step(int frames) {
                 }
                 if (sh.y > measH) measH = sh.y;   // 到達高度は積分の結果
                 sh.fuse -= dt;                    // 時限導火線が焼ける
-                if (sh.fuse <= 0.0 || sh.vy < -12.0) burst(sh);   // 開発
+                // 親玉は秒時が狂っても落下し始めたら開く。子玉(千輪)は下向きに撒かれるので秒時のみ
+                if (sh.fuse <= 0.0 || (sh.gen == 0 && sh.vy < -12.0)) burst(sh);
             }
             for (size_t i = 0; i < shells.size();) {
                 if (!shells[i].alive) { shells[i] = shells.back(); shells.pop_back(); }
@@ -580,12 +753,29 @@ KEEP void sim_step(int frames) {
                 double k = star_k(st.r);
                 double vrx = st.vx - p_wind, vry = st.vy, vrz = st.vz;
                 double sp = sqrt(vrx * vrx + vry * vry + vrz * vrz);
-                st.vx += (-k * sp * vrx) * dt;
-                st.vy += (-k * sp * vry - G_ACC) * dt;
-                st.vz += (-k * sp * vrz) * dt;
+                double ax = -k * sp * vrx, ay = -k * sp * vry - G_ACC, az = -k * sp * vrz;
+                if (st.thrust > 0.0f) {
+                    // 蜂 — 回るノズルの推力。位相も差分で進める
+                    st.sphase += st.spin * (float)dt;
+                    float cs = cosf(st.sphase), sn = sinf(st.sphase);
+                    float th = st.thrust * (float)(st.r / st.r0);   // 燃え尽きるにつれ推力も落ちる
+                    ax += th * (st.ux * cs + st.wx * sn);
+                    ay += th * (st.uy * cs + st.wy * sn);
+                    az += th * (st.uz * cs + st.wz * sn);
+                }
+                st.vx += ax * dt; st.vy += ay * dt; st.vz += az * dt;
                 st.x += st.vx * dt; st.y += st.vy * dt; st.z += st.vz * dt;
+                if (st.delay > 0.0f) { st.delay -= (float)dt; continue; }   // 暗飛行中は燃えない
                 st.r -= st.dr * dt;
-                if (st.r <= 1e-4 || st.y < 0.0) { st.alive = false; continue; }
+                if (st.r <= 1e-4 || st.y < 0.0) {
+                    // 消え際の分砲(パチパチ)
+                    if (st.crackle && st.y > 0.0)
+                        for (int c = 0; c < 10; ++c)
+                            emit_spark(st.x, st.y, st.z,
+                                       st.vx + rnds() * 9.0, st.vy + rnds() * 9.0, st.vz + rnds() * 9.0,
+                                       C_SILVER, 0.00022);
+                    st.alive = false; continue;
+                }
                 // 開花直径も積分の結果 — 開発点からの水平距離の running max
                 double ddx = st.x - st.bx, ddz = st.z - st.bz;
                 double d2 = ddx * ddx + ddz * ddz;
@@ -656,6 +846,7 @@ KEEP uint8_t* sim_render() {
     // 星頭 — 輝度は燃焼表面積 (r/r0)^2 に比例
     for (size_t i = 0; i < stars.size(); ++i) {
         const Star& st = stars[i];
+        if (st.delay > 0.0f) continue;          // 暗飛行中は光らない
         double sx, sy, sc;
         if (!project(st.x, st.y, st.z, sx, sy, sc)) continue;
         double prog = 1.0 - st.r / st.r0;
@@ -718,6 +909,7 @@ int main(int argc, char** argv) {
     int steps = argc > 1 ? atoi(argv[1]) : 480;
     const char* out = argc > 2 ? argv[2] : "hanabi_preview.png";
     int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
+    if (argc > 4) sim_set(10, atof(argv[4]));     // 5番目の引数 = 玉の種類(-1でおまかせ)
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
