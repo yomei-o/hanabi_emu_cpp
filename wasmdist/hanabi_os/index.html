@@ -141,34 +141,47 @@ function buildPanel(){
   const hit=btn=>{ btn.classList.add("hit"); setTimeout(()=>btn.classList.remove("hit"),160); };
   const mk=(txt,cls)=>{ const b=document.createElement("button"); b.textContent=txt;
                         if(cls)b.className=cls; panel.appendChild(b); return b; };
+  // ラベルを毎フレーム書き換えているので、click だと押下中にテキストノードが
+  // 差し替わって取りこぼすことがある。pointerdown で拾い、キーボード操作用に
+  // click も見る(二重発火は時間で抑える)
+  const onPress=(btn,fn)=>{
+    let last=0;
+    const run=()=>{ const now=performance.now(); if(now-last<300) return; last=now;
+                    hit(btn); if(M) fn(); };
+    btn.addEventListener("pointerdown",run);
+    btn.addEventListener("click",run);
+  };
 
   // スターマイン — 実行中は自分が「停止」ボタンになり、進捗も出す
   btnStar=mk("🎆 スターマイン 連打");
   btnStar.title="連打が終わると、空が完全に空になってから余韻(静寂)の時間だけ何も上がりません";
-  btnStar.addEventListener("click",()=>{ if(!M)return; hit(btnStar);
-    api.action(api.get(0)>0 ? 4 : 3); syncButtons(); });
+  // 連打中(phase 1)だけ停止。余韻中や通常時はいつでも手動で開始できる
+  onPress(btnStar,()=>{ api.action(api.get(10)===1 ? 4 : 3); syncButtons(); });
 
   btnOne=mk("🎇 1発打ち上げ");
-  btnOne.addEventListener("click",()=>{ if(!M)return; hit(btnOne); api.action(0); });
+  onPress(btnOne,()=>api.action(0));
 
   // 単発の連発 — ON/OFF が見えるトグル
   btnAuto=mk("⏱ 自動連発");
-  btnAuto.addEventListener("click",()=>{ if(!M)return; hit(btnAuto); api.action(2); syncButtons(); });
+  onPress(btnAuto,()=>{ api.action(2); syncButtons(); });
 
   const btnFs=mk("⛶ フルスクリーン（花火だけ）");
   btnFs.title="花火以外を全部消して全画面に。Esc か F キーで戻る";
-  btnFs.addEventListener("click",()=>{ hit(btnFs); toggleFullscreen(); });
+  onPress(btnFs,()=>toggleFullscreen());
 
   btnPlay=mk("⏸ 一時停止","primary");
-  btnPlay.addEventListener("click",()=>{ playing=!playing;
-    btnPlay.textContent=playing?"⏸ 一時停止":"▶ 再生"; if(playing){lastT=0;loop();} });
+  onPress(btnPlay,()=>{ playing=!playing;
+    setText(btnPlay, playing?"⏸ 一時停止":"▶ 再生"); if(playing){lastT=0;loop();} });
 
   const rs=mk("⟲ リセット");
-  rs.addEventListener("click",()=>{ if(!M)return; hit(rs); api.reset(); frames=0;
+  onPress(rs,()=>{ api.reset(); frames=0;
     syncButtons(); if(!playing){api.step(0);blit();} });
 
   syncButtons();
 }
+
+// 変わったときだけ書く。毎フレーム textContent を差し替えるとクリックを取りこぼす
+function setText(el,s){ if(el.textContent!==s) el.textContent=s; }
 
 // C++ 側の状態をボタンの見た目に反映する
 function syncButtons(){
@@ -177,24 +190,24 @@ function syncButtons(){
   const cur=THEMES[(api.get(13)|0)]||"";           // おまかせで実際に引かれたテーマ
   const curShort=cur.replace(/ —.*$/,"");
   if(phase===1){
-    btnStar.textContent=`■ 停止  ${curShort} ${total-left}/${total}`;
+    setText(btnStar,`■ 停止  ${curShort} ${total-left}/${total}`);
     btnStar.classList.add("running");
   }else if(phase===2){
     // 余韻中。空が空になってから静寂のカウントダウンが始まる
     const q=api.get(11);
-    btnStar.textContent = (api.get(2)>0||api.get(4)>0) ? "🌙 余韻…（開いている）"
-                                                      : `🌙 余韻… ${q.toFixed(1)}s`;
+    setText(btnStar, (api.get(2)>0||api.get(4)>0) ? "🌙 余韻…（押すと次を開始）"
+                                                  : `🌙 余韻… ${q.toFixed(0)}s`);
     btnStar.classList.remove("running");
   }else{
     // 待機中は「選んでいるもの」＋次の自動打ち上げまでのカウントダウンを出す
     const th=(THEMES[(api.get(12)|0)]||"").replace(/ —.*$/,"").replace(/（.*）/,"");
-    const iv=api.get(15), left=Math.max(0,api.get(14));
-    const cd = iv>0.5 ? `  ⏳${Math.floor(left/60)}:${String(Math.floor(left%60)).padStart(2,"0")}` : "";
-    btnStar.textContent=`🎆 スターマイン ${th}${cd}`;
+    const iv=api.get(15), rest=Math.max(0,api.get(14));
+    const cd = iv>0.5 ? `  ⏳${Math.floor(rest/60)}:${String(Math.floor(rest%60)).padStart(2,"0")}` : "";
+    setText(btnStar,`🎆 スターマイン ${th}${cd}`);
     btnStar.classList.remove("running");
   }
   const auto=api.get(5)>0.5;
-  btnAuto.textContent = auto ? "⏱ 自動連発: ON" : "⏱ 自動連発: OFF";
+  setText(btnAuto, auto ? "⏱ 自動連発: ON" : "⏱ 自動連発: OFF");
   btnAuto.classList.toggle("on", auto);
 }
 
@@ -211,12 +224,12 @@ function loop(ts){
   api.step(n); blit(); frames+=n;
   syncButtons();
   const ph=api.get(10);
-  statusEl.textContent =
+  setText(statusEl,
     (ph===1 ? `🎆 ${(THEMES[(api.get(13)|0)]||"").replace(/ —.*$/,"")} ${(api.get(1)-api.get(0))|0}/${api.get(1)|0}   `
    : ph===2 ? `🌙 余韻   ` : ``) +
     `${fpsAvg.toFixed(0)} fps (x${n})   玉 ${api.get(4)|0} 発上昇中   星 ${api.get(2)|0} 個   ` +
     `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   引先 ${(api.get(8)*100).toFixed(0)}%   ` +
-    `実測 到達高度 ${api.get(6).toFixed(0)}m / 開花直径 ${api.get(7).toFixed(0)}m`;
+    `実測 到達高度 ${api.get(6).toFixed(0)}m / 開花直径 ${api.get(7).toFixed(0)}m`);
   raf=requestAnimationFrame(loop);
 }
 
