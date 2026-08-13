@@ -133,13 +133,25 @@ struct Star {
     // --- 蜂(ハチ): ノズルの推力ベクトルが軸まわりに回る ---
     float ux, uy, uz;      // 推力が回る平面の基底 u
     float wx, wy, wz;      //                        w  (u ⊥ w ⊥ 回転軸)
-    float thrust;          // 推力による加速度 [m/s^2] (0 なら普通の星)
-    float spin;            // 回転角速度 [rad/s]
+    float thrust;          // ノズルの推力/質量 [m/s^2] (0 なら普通の星)
+    float spin;            // 回転角速度 [rad/s] — 空気抵抗でだんだん落ちる
+    float spinB;           // 回転の抵抗係数 [1/rad]  dω/dt = -B|ω|ω
     float sphase;          // 現在の位相 [rad]
+    bool  orbit;           // true=渦蜂(中心のまわりを周回) / false=蜂(推力の向きが回る)
     float delay;           // 暗飛行(点火までの時間)[s] — 飛んではいるが光らない
     bool  crackle;         // 消え際に分砲(パチパチ)する星か
     bool  alive;
 };
+// 蜂は2種類あって、回り方の仕組みが違う。
+//  ・蜂   : ノズルの推力の「向き」が回る。星はその力に振り回されて思い思いに飛ぶ
+//  ・渦蜂 : 星そのものが中心のまわりを回りながら飛ぶ。
+//           x,y,z は回る中心(普通の星と同じ弾道)で、星はその中心を半径 R で周回する。
+//           ノズルの推力が向心力そのものなので  推力 = R ω^2  →  R = 推力/ω^2。
+//           回転は空気抵抗で落ちる(dω/dt = -B|ω|ω)ので、輪はだんだん開いていく。
+struct Star;
+static void hachi_offset(const Star& st, double& ox, double& oy, double& oz,
+                         double& ovx, double& ovy, double& ovz);
+
 struct Spark {
     float x, y, z, vx, vy, vz;
     float k;               // 弾道係数
@@ -176,6 +188,24 @@ enum {
 };
 static inline bool is_shaped(int t) { return t == T_HEART || t == T_RING || t == T_SATURN; }
 struct Flash { double x, y, z; double t, t0, pw; bool alive; };
+
+// 中心からのずれと、周回による速度を返す
+static void hachi_offset(const Star& st, double& ox, double& oy, double& oz,
+                         double& ovx, double& ovy, double& ovz) {
+    double w = st.spin;
+    double aw = fabs(w);
+    if (aw < 0.5) aw = 0.5;
+    double R = st.thrust * (st.r / st.r0) / (aw * aw);
+    if (R > 22.0) R = 22.0;                       // 回転が落ちきっても暴れないように
+    double cs = cos(st.sphase), sn = sin(st.sphase);
+    ox = R * (st.ux * cs + st.wx * sn);
+    oy = R * (st.uy * cs + st.wy * sn);
+    oz = R * (st.uz * cs + st.wz * sn);
+    // 接線速度 = R ω (-u sinθ + w cosθ)
+    ovx = R * w * (-st.ux * sn + st.wx * cs);
+    ovy = R * w * (-st.uy * sn + st.wy * cs);
+    ovz = R * w * (-st.uz * sn + st.wz * cs);
+}
 
 static std::vector<Star>  stars;
 static std::vector<Spark> sparks;
@@ -393,8 +423,9 @@ static void burst(Shell& sh) {
     double tv = 1.0, tb = 1.0, tshed = 1.0, tthrust = 0.0;
     if (sh.type == T_BOTAN)  { tv = 1.10; tb = 0.75; tshed = 0.0; }   // 牡丹 — 尾を引かない
     if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
+    // 蜂の類は推進薬を推力と回転に使い切るので、燃焼は短い(1.5〜2秒)。光る時間も短い
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
-    if (sh.type == T_UZU)    { tv = 0.82; tb = 1.75; tshed = 1.10; tthrust = 2.0; }  // 渦蜂
+    if (sh.type == T_UZU)    { tv = 0.90; tb = 0.34; tshed = 1.60; tthrust = 2.0; }  // 渦蜂
     if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
                        || is_shaped(sh.type)) ? 0 : sh.layers);
@@ -405,7 +436,8 @@ static void burst(Shell& sh) {
     if (gal < 1e-6) { gax = 0; gay = 1; gaz = 0; gal = 1; }
     gax /= gal; gay /= gal; gaz /= gal;
     double gsign = (rnd() < 0.5) ? -1.0 : 1.0;
-    double gomega = 5.0 + 2.5 * rnd();      // [rad/s] 玉ごとの渦の巻き速さ(約1回転/秒)
+    double gomega = 26.0 + 14.0 * rnd();    // [rad/s] 点火直後の回転(4〜6回転/秒)
+    double gdamp  = 0.16 + 0.10 * rnd();    // 回転の落ち方
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
         // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
@@ -482,7 +514,7 @@ static void burst(Shell& sh) {
             st.shedRate = (float)(115.0 * p_shed * tshed);
             st.delay = (L == 0) ? 0.0f : (float)(0.10 + 0.16 * L);   // 芯は少し遅れて点火(時差開発)
             st.crackle = crackle;
-            st.thrust = 0.0f; st.spin = 0.0f; st.sphase = 0.0f;
+            st.thrust = 0.0f; st.spin = 0.0f; st.spinB = 0.0f; st.sphase = 0.0f; st.orbit = false;
             st.ux = st.uy = st.uz = st.wx = st.wy = st.wz = 0.0f;
 
             if (tthrust > 0.0) {
@@ -509,14 +541,18 @@ static void burst(Shell& sh) {
                 st.wx = (float)wx; st.wy = (float)wy; st.wz = (float)wz;
                 // 回転が速すぎると推力が打ち消し合ってブルブルするだけになる。
                 // 0.1〜1回転/秒 くらいにすると、はっきりした輪を描いて飛ぶ
+                st.orbit = uzu;
                 if (uzu) {
-                    // 渦の半径 ≒ 推力/角速度^2。速く回して半径を数mに抑え、
-                    // 飛翔速度は高いままにするので、細かく巻きながら遠くまで飛ぶ
-                    st.thrust = (float)(230.0 + 190.0 * rnd());
+                    // 渦蜂 — 半径 R = 推力/ω^2。点火直後は速く回るので輪は小さく、
+                    // 回転が落ちるにつれて輪が開いていく。回転にエネルギーを使うので短命
+                    st.thrust = (float)(280.0 + 220.0 * rnd());
                     st.spin   = (float)(gsign * gomega * (1.0 + rnds() * 0.10)); // 向きも速さも揃える
+                    st.spinB  = (float)(gdamp * (1.0 + rnds() * 0.15));
                 } else {
-                    st.thrust = (float)(45.0 + 60.0 * rnd());                  // [m/s^2]
-                    st.spin   = (float)((0.7 + 5.5 * rnd()) * (rnd() < 0.5 ? -1.0 : 1.0)); // [rad/s]
+                    // 蜂 — 推力の向きが回る。思い思いの方向へ飛んでいく
+                    st.thrust = (float)(45.0 + 60.0 * rnd());
+                    st.spin   = (float)((0.7 + 5.5 * rnd()) * (rnd() < 0.5 ? -1.0 : 1.0));
+                    st.spinB  = 0.0f;
                 }
                 st.sphase = (float)(rnd() * 6.2831853);
             }
@@ -814,13 +850,18 @@ KEEP void sim_step(int frames) {
                 double sp = sqrt(vrx * vrx + vry * vry + vrz * vrz);
                 double ax = -k * sp * vrx, ay = -k * sp * vry - G_ACC, az = -k * sp * vrz;
                 if (st.thrust > 0.0f) {
-                    // 蜂 — 回るノズルの推力。位相も差分で進める
+                    // 回転は空気抵抗で落ちていく: dω/dt = -B|ω|ω (これも差分)
+                    st.spin -= st.spinB * fabsf(st.spin) * st.spin * (float)dt;
                     st.sphase += st.spin * (float)dt;
-                    float cs = cosf(st.sphase), sn = sinf(st.sphase);
-                    float th = st.thrust * (float)(st.r / st.r0);   // 燃え尽きるにつれ推力も落ちる
-                    ax += th * (st.ux * cs + st.wx * sn);
-                    ay += th * (st.uy * cs + st.wy * sn);
-                    az += th * (st.uz * cs + st.wz * sn);
+                    if (!st.orbit) {
+                        // 蜂 — 回るノズルの推力がそのまま加速度になる
+                        float cs = cosf(st.sphase), sn = sinf(st.sphase);
+                        float th = st.thrust * (float)(st.r / st.r0);
+                        ax += th * (st.ux * cs + st.wx * sn);
+                        ay += th * (st.uy * cs + st.wy * sn);
+                        az += th * (st.uz * cs + st.wz * sn);
+                    }
+                    // 渦蜂は推力が向心力に使われるので、中心の運動には効かない
                 }
                 st.vx += ax * dt; st.vy += ay * dt; st.vz += az * dt;
                 st.x += st.vx * dt; st.y += st.vy * dt; st.z += st.vz * dt;
@@ -844,13 +885,19 @@ KEEP void sim_step(int frames) {
                 Col hc = (prog < st.chg) ? st.c0 : st.c1;
                 (void)hc;
                 st.shed += st.shedRate * qual * dt;
-                while (st.shed >= 1.0) {
-                    st.shed -= 1.0;
-                    emit_spark(st.x, st.y, st.z,
-                               st.vx * 0.12 + rnds() * 2.0,
-                               st.vy * 0.12 + rnds() * 2.0,
-                               st.vz * 0.12 + rnds() * 2.0,
-                               st.tail, 0.00032);
+                if (st.shed >= 1.0) {
+                    // 渦蜂は中心のまわりを回っているので、火の粉は周回中の位置から
+                    // 接線方向の速度を持って剥がれる(これが渦の軌跡になる)
+                    double ox = 0, oy = 0, oz = 0, ovx = 0, ovy = 0, ovz = 0;
+                    if (st.orbit) hachi_offset(st, ox, oy, oz, ovx, ovy, ovz);
+                    while (st.shed >= 1.0) {
+                        st.shed -= 1.0;
+                        emit_spark(st.x + ox, st.y + oy, st.z + oz,
+                                   (st.vx + ovx) * 0.12 + rnds() * 2.0,
+                                   (st.vy + ovy) * 0.12 + rnds() * 2.0,
+                                   (st.vz + ovz) * 0.12 + rnds() * 2.0,
+                                   st.tail, 0.00032);
+                    }
                 }
             }
             for (size_t i = 0; i < stars.size();) {
@@ -907,7 +954,9 @@ KEEP uint8_t* sim_render() {
         const Star& st = stars[i];
         if (st.delay > 0.0f) continue;          // 暗飛行中は光らない
         double sx, sy, sc;
-        if (!project(st.x, st.y, st.z, sx, sy, sc)) continue;
+        double ox = 0, oy = 0, oz = 0, ovx, ovy, ovz;
+        if (st.orbit) hachi_offset(st, ox, oy, oz, ovx, ovy, ovz);
+        if (!project(st.x + ox, st.y + oy, st.z + oz, sx, sy, sc)) continue;
         double prog = 1.0 - st.r / st.r0;
         Col c = (prog < st.chg) ? st.c0 : st.c1;
         float f = (float)((st.r / st.r0) * (st.r / st.r0));
