@@ -235,6 +235,7 @@ static double p_shots = 100.0;   // スターマインの発数
 static double p_rapid = 0.22;    // 連打間隔 [s]
 static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
 static double p_starInt = 120.0; // 自動スターマインの間隔 [s] (0 で自動なし)
+static double p_hud = 1.0;       // 画面内の文字表示 (0 で花火だけ)
 static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
 static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
 
@@ -735,6 +736,7 @@ KEEP void sim_set(int id, double v) {
         if (v > 0.5 && (old <= 0.5 || starTimer > v)) starTimer = v;
         break;
     }
+    case 13: p_hud = v; break;
     }
 }
 
@@ -1017,6 +1019,8 @@ KEEP uint8_t* sim_render() {
         px[i] = rgb(R > 255 ? 255 : R, G > 255 ? 255 : G, B > 255 ? 255 : B);
     }
 
+    if (p_hud < 0.5) return (uint8_t*)px.data();     // 文字なし(フルスクリーン鑑賞モード)
+
     Olivec_Canvas oc = olivec_canvas(px.data(), FW, FH, FW);
     char buf[160];
     snprintf(buf, sizeof(buf), "KIKU %d-GO %.0fmm  lift %.0f  burst %.0f m/s -> H %.0fm  flower %.0fm",
@@ -1052,6 +1056,7 @@ int main(int argc, char** argv) {
     if (argc > 4) sim_set(10, atof(argv[4]));     // 5番目の引数 = 玉の種類(-1でおまかせ)
     if (argc > 5) sim_set(11, atof(argv[5]));     // 6番目の引数 = スターマインのテーマ
     if (argc > 6) sim_set(12, atof(argv[6]));     // 7番目の引数 = 自動スターマインの間隔
+    if (argc > 7) sim_set(13, atof(argv[7]));     // 8番目の引数 = 0 で HUD の文字を消す
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷

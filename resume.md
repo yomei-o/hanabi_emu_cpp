@@ -81,6 +81,10 @@ T_HACHI, T_UZU, T_SENRIN, T_HEART, T_RING, T_SATURN }`。
 （`p_quiet`、既定6秒）を差分で消化してから通常に戻す。30発なら 打上4.5s → 最後の星が消えるのが18.0s →
 静寂6s → 24.0s に復帰 → `launchTimer` ぶん待って 26.5s に単発再開（ネイティブのタイムラインで確認済み）。
 
+**フルスクリーン鑑賞モード**。`sim_set(13,0)` で C++ 側の HUD 文字を消し（`sim_render` の先頭で早期 return）、
+JS 側は `body.fs` クラスでページのUIを隠して canvas を `object-fit:contain` で全画面に。F キー / Esc で切替。
+ネイティブでも8番目の引数に 0 を渡せば文字なしで撮れる（README の画像はこれで作った）。
+
 **自動スターマイン**（`p_starInt`、既定120s）。`starTimer` は **barPhase==0 のときだけ**減る。
 連打中と余韻では止まるので、間隔は「静かな時間」で測られる。ネイティブで7番目の引数に間隔を渡すと検証できる
 （`/tmp/hanabi 4200 out.png 0 -1 0 15` で15秒おきに自動発火するのを確認済み）。
@@ -94,7 +98,7 @@ T_HACHI, T_UZU, T_SENRIN, T_HEART, T_RING, T_SATURN }`。
 - `sim_render()` — HDR加算バッファへのスプラット → `x/(1+x)` トーンマップ → 夜空に合成
 - `MAX_SPARKS = 560000` / `MAX_STARS = 120000` — 粒子予算
 - ABI: `sim_init/w/h/reset/step/render/click/set/action` + 独自追加の `sim_get(id)`
-  （`sim_set` の id: 0号数 1星数 2打上間隔 3風速 4火の粉 5芯 6残光 7連打発数 8連打間隔 9余韻 10玉の種類 11テーマ 12自動スターマイン間隔）
+  （`sim_set` の id: 0号数 1星数 2打上間隔 3風速 4火の粉 5芯 6残光 7連打発数 8連打間隔 9余韻 10玉の種類 11テーマ 12自動スターマイン間隔 13HUD表示）
   （`sim_get` の id: 0連打残 1連打総数 2星数 3火の粉数 4玉数 5自動連発 6実測高度 7実測直径 8qual 9時刻 10フェーズ 11余韻残 12テーマ 13実テーマ 14次の自動連打まで 15自動間隔）
 - `THEMES[]` — スターマインのテーマ表 `{type, fixc}`。type -2=型物ランダム。添字0=おまかせで、
   `start_barrage()` が **連打ごとに1〜9からランダムに1つ引いて `curTheme` に確定**させる
