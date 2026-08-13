@@ -157,6 +157,7 @@ struct Shell {
     int scheme;
     int type;              // 玉の種類(下の enum)
     int gen;               // 世代 (0=親玉, 1=千輪の子玉)
+    int fixc;              // テーマで炎色を固定するとき FIXCOL の添字。-1 で自由
     bool alive;
 };
 
@@ -165,7 +166,8 @@ enum {
     T_KIKU = 0,   // 菊     — 引先を長く曳く。基本形
     T_BOTAN,      // 牡丹   — 尾なし。点の集まりで開く
     T_YANAGI,     // 柳     — 低速・長燃焼で垂れ下がる
-    T_HACHI,      // 蜂     — 星が自分で推力を出し、その向きが回る = クルクル飛ぶ
+    T_HACHI,      // 蜂     — 星が自分で推力を出し、その向きが回る = 思い思いにクルクル飛ぶ
+    T_UZU,        // 渦蜂   — 回転軸を玉全体で揃えた蜂。強い推力＋ゆっくりの回転で大きな渦を巻く
     T_SENRIN,     // 千輪   — 子玉を撒き、少し遅れて一斉に小さく開く
     T_HEART,      // 型物   — ハート
     T_RING,       // 型物   — 輪
@@ -197,7 +199,8 @@ static bool   p_auto = true;
 static double p_shots = 100.0;   // スターマインの発数
 static double p_rapid = 0.22;    // 連打間隔 [s]
 static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
-static double p_type = -1.0;     // 玉の種類 (-1 = おまかせ)
+static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
+static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
 
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
@@ -223,6 +226,9 @@ static const Col C_BLUE   = { 0.28f, 0.52f, 1.00f };
 static const Col C_SILVER = { 1.00f, 0.97f, 0.90f };
 static const Col C_LEMON  = { 1.00f, 0.93f, 0.30f };
 static const Col C_PURPLE = { 0.72f, 0.36f, 1.00f };
+static const Col C_PINK   = { 1.00f, 0.48f, 0.66f };   // 桜色
+// テーマで色を固定するときの表
+static const Col FIXCOL[] = { C_PINK, C_RED, C_GREEN, C_BLUE, C_LEMON, C_SILVER, C_PURPLE, C_GOLD };
 
 static inline Col mixc(Col a, Col b, float t) {
     return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t };
@@ -387,13 +393,22 @@ static void burst(Shell& sh) {
     if (sh.type == T_BOTAN)  { tv = 1.10; tb = 0.75; tshed = 0.0; }   // 牡丹 — 尾を引かない
     if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
+    if (sh.type == T_UZU)    { tv = 0.34; tb = 1.85; tshed = 1.10; tthrust = 2.0; }  // 渦蜂
     if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
-    int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || is_shaped(sh.type)) ? 0 : sh.layers);
+    int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
+                       || is_shaped(sh.type)) ? 0 : sh.layers);
     bool crackle = (rnd() < 0.20);          // 消え際に分砲(パチパチ)する玉か
+    // 渦蜂は回転軸を玉全体で共有する。これで全部の星が同じ向きに大きな渦を巻く
+    double gax = rnds(), gay = rnds(), gaz = rnds();
+    double gal = sqrt(gax * gax + gay * gay + gaz * gaz);
+    if (gal < 1e-6) { gax = 0; gay = 1; gaz = 0; gal = 1; }
+    gax /= gal; gay /= gal; gaz /= gal;
+    double gsign = (rnd() < 0.5) ? -1.0 : 1.0;
+    double gomega = 1.15 + 0.85 * rnd();    // [rad/s] 玉ごとの渦の巻き速さ
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
         // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
-        double tn = (sh.type == T_HACHI) ? 0.38 : 1.0;
+        double tn = (sh.type == T_HACHI) ? 0.38 : (sh.type == T_UZU ? 0.24 : 1.0);
         int n = (int)(s.nstar * p_density * tn * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
         if (n < 8) n = 8;
         if (stars.size() + n > MAX_STARS) n = (int)(MAX_STARS - std::min(MAX_STARS, stars.size()));
@@ -409,7 +424,13 @@ static void burst(Shell& sh) {
         double burnT = s.burnT * (L == 0 ? 1.0 : 0.8) * tb;
         if (sh.type == T_YANAGI) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
         if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.4f; tail = C_GOLD; }
+        if (sh.type == T_UZU)    { c0 = C_SILVER; c1 = C_GOLD; chg = 0.3f; tail = C_GOLD; }
         if (is_shaped(sh.type))  { c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.25f); }
+        // テーマで炎色を固定する場合(例: 桜 = ピンクの菊だけ)
+        if (sh.fixc >= 0) {
+            c0 = c1 = FIXCOL[sh.fixc]; chg = 1.0f;
+            tail = mixc(c0, C_GOLD, 0.30f);
+        }
 
         for (int i = 0; i < n; ++i) {
             double dx, dy, dz, v;
@@ -466,8 +487,15 @@ static void burst(Shell& sh) {
             if (tthrust > 0.0) {
                 // 蜂 — 星が自分で推力を出し、その向きが軸まわりに回る。
                 // 推力方向 = u cos(θ) + w sin(θ),  θ += spin*dt
-                // 回転が速いと推力が打ち消し合ってブルブル、遅いと大きな輪を描く
-                double axx = rnds(), axy = rnds(), axz = rnds();
+                // 回転が速いと推力が打ち消し合ってブルブル、遅いと大きな輪を描く。
+                // 渦の半径はだいたい (推力)/(角速度)^2 になる
+                bool uzu = (sh.type == T_UZU);
+                double axx, axy, axz;
+                if (uzu) {                     // 渦蜂 — 玉で共通の軸(わずかに揺らす)
+                    axx = gax + rnds() * 0.07; axy = gay + rnds() * 0.07; axz = gaz + rnds() * 0.07;
+                } else {                       // 蜂 — 星ごとにバラバラの軸
+                    axx = rnds(); axy = rnds(); axz = rnds();
+                }
                 double al = sqrt(axx * axx + axy * axy + axz * axz);
                 if (al < 1e-6) { axx = 0; axy = 1; axz = 0; al = 1; }
                 axx /= al; axy /= al; axz /= al;
@@ -480,8 +508,13 @@ static void burst(Shell& sh) {
                 st.wx = (float)wx; st.wy = (float)wy; st.wz = (float)wz;
                 // 回転が速すぎると推力が打ち消し合ってブルブルするだけになる。
                 // 0.1〜1回転/秒 くらいにすると、はっきりした輪を描いて飛ぶ
-                st.thrust = (float)(45.0 + 60.0 * rnd());      // [m/s^2]
-                st.spin   = (float)((0.7 + 5.5 * rnd()) * (rnd() < 0.5 ? -1.0 : 1.0)); // [rad/s]
+                if (uzu) {
+                    st.thrust = (float)(95.0 + 55.0 * rnd());                  // 強い推力
+                    st.spin   = (float)(gsign * gomega * (1.0 + rnds() * 0.10)); // 向きも速さも揃える
+                } else {
+                    st.thrust = (float)(45.0 + 60.0 * rnd());                  // [m/s^2]
+                    st.spin   = (float)((0.7 + 5.5 * rnd()) * (rnd() < 0.5 ? -1.0 : 1.0)); // [rad/s]
+                }
                 st.sphase = (float)(rnd() * 6.2831853);
             }
             st.alive = true;
@@ -500,6 +533,7 @@ static void burst(Shell& sh) {
 static void spawn_child(const Shell& p, double dx, double dy, double dz, double v,
                         double go, double fuse, int type) {
     if (shells.size() >= 400) return;
+    (void)0;
     ShellSpec s = spec_of(go);
     Shell c;
     c.x = p.x; c.y = p.y; c.z = p.z;
@@ -511,13 +545,15 @@ static void spawn_child(const Shell& p, double dx, double dy, double dz, double 
     c.type = type;
     c.layers = 0;
     c.scheme = (rnd() < 0.5) ? 0 : 1;
+    c.fixc = p.fixc;                 // 千輪の子玉はテーマの色を引き継ぐ
     c.gen = p.gen + 1;
     c.alive = true;
     shells.push_back(c);
 }
 
 // nx: 画面内の水平位置 [-1,1] (-1000 でランダム) / go: 号数 / type: 玉の種類(T_*)
-static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
+// fixc: 炎色の固定(FIXCOL の添字。-1 で自由)
+static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int fixc = -1) {
     if (shells.size() >= 90) return;
     if (go < 3.0) go = 3.0;
     ShellSpec s = spec_of(go);
@@ -534,6 +570,7 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
     sh.sp = s;
     sh.type = type;
     sh.gen = 0;
+    sh.fixc = fixc;
     sh.layers = (int)(p_layers + 0.5);
     double q = rnd();
     sh.scheme = (sh.layers > 0 && q < 0.30) ? 3 : (q < 0.55 ? 0 : (q < 0.85 ? 1 : 2));
@@ -545,27 +582,56 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03) {
 static int pick_type() {
     if (p_type >= 0) return (int)(p_type + 0.5);
     double q = rnd();
-    if (q < 0.34) return T_KIKU;
-    if (q < 0.46) return T_BOTAN;
-    if (q < 0.58) return T_YANAGI;
-    if (q < 0.70) return T_HACHI;
-    if (q < 0.82) return T_SENRIN;
-    if (q < 0.88) return T_HEART;
-    if (q < 0.94) return T_RING;
+    if (q < 0.30) return T_KIKU;
+    if (q < 0.42) return T_BOTAN;
+    if (q < 0.53) return T_YANAGI;
+    if (q < 0.64) return T_HACHI;
+    if (q < 0.74) return T_UZU;
+    if (q < 0.85) return T_SENRIN;
+    if (q < 0.90) return T_HEART;
+    if (q < 0.95) return T_RING;
     return T_SATURN;
 }
 // 連打では千輪や型物は控えめに(子玉が増えすぎるし、形は単発でこそ映える)
-static int pick_type_barrage() {
-    if (p_type >= 0) return (int)(p_type + 0.5);
+static int pick_type_mixed() {
     double q = rnd();
-    if (q < 0.46) return T_KIKU;
-    if (q < 0.64) return T_BOTAN;
-    if (q < 0.74) return T_YANAGI;
-    if (q < 0.87) return T_HACHI;
-    if (q < 0.93) return T_SENRIN;
-    if (q < 0.96) return T_HEART;
+    if (q < 0.42) return T_KIKU;
+    if (q < 0.58) return T_BOTAN;
+    if (q < 0.68) return T_YANAGI;
+    if (q < 0.78) return T_HACHI;
+    if (q < 0.86) return T_UZU;
+    if (q < 0.92) return T_SENRIN;
+    if (q < 0.95) return T_HEART;
     if (q < 0.98) return T_RING;
     return T_SATURN;
+}
+
+// スターマインのテーマ。1テーマ = 1種類に揃えるので、菊とハートが混ざって濁らない。
+// type: -1=混成おまかせ / -2=型物からランダム / それ以外は T_* をそのまま
+// fixc: FIXCOL の添字で炎色を固定(-1 で自由)
+struct Theme { int type; int fixc; };
+static const Theme THEMES[] = {
+    { -1, -1 },        // 0 おまかせ(全部混ぜる)
+    { T_KIKU,   -1 },  // 1 菊 — 色とりどり
+    { T_KIKU,    0 },  // 2 桜 — ピンクの菊だけ
+    { T_KIKU,    5 },  // 3 銀世界 — 銀の菊だけ
+    { T_BOTAN,  -1 },  // 4 牡丹
+    { T_YANAGI, -1 },  // 5 金の柳
+    { T_HACHI,  -1 },  // 6 蜂
+    { T_UZU,    -1 },  // 7 渦蜂
+    { T_SENRIN, -1 },  // 8 千輪
+    { -2,       -1 },  // 9 型物
+};
+static const int THEME_COUNT = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
+
+static void theme_pick(int& ty, int& fx) {
+    int ti = (int)(p_theme + 0.5);
+    if (ti < 0) ti = 0; if (ti >= THEME_COUNT) ti = THEME_COUNT - 1;
+    const Theme& th = THEMES[ti];
+    fx = th.fixc;
+    if (th.type == -1)      ty = pick_type_mixed();
+    else if (th.type == -2) { const int s[3] = { T_HEART, T_RING, T_SATURN }; ty = s[(int)(rnd() * 3)]; }
+    else                    ty = th.type;
 }
 static void launch(double nx) { launch_ex(nx, p_go, pick_type()); }
 
@@ -624,6 +690,7 @@ KEEP void sim_set(int id, double v) {
     case 8: p_rapid = v; break;
     case 9: p_quiet = v; break;
     case 10: p_type = v; break;
+    case 11: p_theme = v; break;
     }
 }
 
@@ -642,6 +709,7 @@ KEEP double sim_get(int id) {
     case 9: return simTime;
     case 10: return (double)barPhase;
     case 11: return quietTimer;
+    case 12: return p_theme;
     }
     return 0.0;
 }
@@ -679,18 +747,15 @@ KEEP void sim_step(int frames) {
                     int volley = 1 + (int)(rnd() * 2.7);          // 1〜3発同時に上がる
                     for (int v = 0; v < volley && barLeft > 0; ++v) {
                         bool last = (barLeft == 1);
-                        double go; int ty;
-                        if (last) { go = p_go; ty = (p_type >= 0) ? (int)p_type : T_KIKU; }  // 締めは大玉の菊
-                        else if (rnd() < 0.12) { go = p_go; ty = pick_type_barrage(); }
-                        else {
-                            go = floor(p_go * (0.45 + 0.50 * rnd()) + 0.5);    // 小玉主体の早打ち
-                            ty = pick_type_barrage();
-                        }
+                        int ty, fx; theme_pick(ty, fx);
+                        double go = (last || rnd() < 0.12)
+                                  ? p_go
+                                  : floor(p_go * (0.45 + 0.50 * rnd()) + 0.5);   // 小玉主体の早打ち
                         // 左右に掃引しながら上げる(実際のスターマインの並び)
                         double prog = 1.0 - (double)barLeft / (double)barTotal;
                         double sweep = sin(prog * 15.7) * 0.82 + rnds() * 0.30;   // 左右2.5往復
                         if (last) sweep = rnds() * 0.15;
-                        launch_ex(sweep, go, (int)ty, last ? 0.02 : 0.13);
+                        launch_ex(sweep, go, ty, last ? 0.02 : 0.13, fx);
                         barLeft--;
                     }
                     barTimer = p_rapid * (0.55 + 0.9 * rnd());
@@ -910,6 +975,7 @@ int main(int argc, char** argv) {
     const char* out = argc > 2 ? argv[2] : "hanabi_preview.png";
     int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
     if (argc > 4) sim_set(10, atof(argv[4]));     // 5番目の引数 = 玉の種類(-1でおまかせ)
+    if (argc > 5) sim_set(11, atof(argv[5]));     // 6番目の引数 = スターマインのテーマ
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷

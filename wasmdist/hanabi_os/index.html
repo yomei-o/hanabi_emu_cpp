@@ -76,7 +76,10 @@ const CONFIG = {
 const $=id=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
 let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
-let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null;
+let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, selTheme=null;
+// C++ 側 THEMES[] と同じ並び
+const THEMES=["🎲 おまかせ（全部混ぜる）","菊 — 色とりどり","🌸 桜 — ピンクの菊だけ",
+              "銀世界 — 銀の菊だけ","牡丹","金の柳","蜂","渦蜂","千輪","型物"];
 
 createSim().then(mod=>{
   M=mod;
@@ -98,19 +101,25 @@ createSim().then(mod=>{
 });
 
 function buildPanel(){
-  // 玉の種類
-  {
-    const wrap=document.createElement("label"); wrap.className="ctl"; wrap.style.minWidth="190px";
-    const head=document.createElement("span"); head.innerHTML="玉の種類";
+  const mkSelect=(labelText,id,opts,def,width)=>{
+    const wrap=document.createElement("label"); wrap.className="ctl"; wrap.style.minWidth=width;
+    const head=document.createElement("span"); head.innerHTML=labelText;
     const sel=document.createElement("select");
-    [["-1","🎲 おまかせ"],["0","菊 — 長い引先"],["1","牡丹 — 尾なし"],["2","柳 — 垂れ下がる"],
-     ["3","蜂 — クルクル回る"],["4","千輪 — 子玉が一斉に開く"],["5","型物 ハート"],
-     ["6","型物 輪"],["7","型物 土星"]].forEach(([v,t])=>{
-      const o=document.createElement("option"); o.value=v; o.textContent=t; sel.appendChild(o); });
-    sel.value="-1";
-    sel.addEventListener("change",()=>{ if(M)api.set(10,+sel.value); });
+    opts.forEach(([v,t])=>{ const o=document.createElement("option");
+      o.value=v; o.textContent=t; sel.appendChild(o); });
+    sel.value=def;
+    sel.addEventListener("change",()=>{ if(M){api.set(id,+sel.value); syncButtons();} });
     wrap.appendChild(head); wrap.appendChild(sel); panel.appendChild(wrap);
-  }
+    return sel;
+  };
+  // 単発・自動連発で上げる玉の種類
+  mkSelect("玉の種類（単発）",10,
+    [["-1","🎲 おまかせ"],["0","菊 — 長い引先"],["1","牡丹 — 尾なし"],["2","柳 — 垂れ下がる"],
+     ["3","蜂 — 思い思いにクルクル"],["4","渦蜂 — 大きな渦を巻く"],["5","千輪 — 子玉が一斉に開く"],
+     ["6","型物 ハート"],["7","型物 輪"],["8","型物 土星"]],"-1","200px");
+  // スターマインのテーマ(1テーマ=1種類。混ざって濁らない)
+  selTheme=mkSelect("スターマインのテーマ",11,
+    THEMES.map((t,i)=>[String(i),t]),"0","210px");
   CONFIG.sliders.forEach(s=>{
     const wrap=document.createElement("label"); wrap.className="ctl";
     const head=document.createElement("span"); head.innerHTML=`${s.label} <b id="v${s.id}">${(+s.val).toFixed(s.dec)}</b>`;
@@ -162,7 +171,8 @@ function syncButtons(){
                                                       : `🌙 余韻… ${q.toFixed(1)}s`;
     btnStar.classList.remove("running");
   }else{
-    btnStar.textContent="🎆 スターマイン 連打";
+    const th=THEMES[(api.get(12)|0)] || "";
+    btnStar.textContent=`🎆 スターマイン ${th.replace(/ —.*$/,"")}`;
     btnStar.classList.remove("running");
   }
   const auto=api.get(5)>0.5;
