@@ -78,7 +78,7 @@ const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status"
 let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
 let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, selTheme=null;
 // C++ 側 THEMES[] と同じ並び
-const THEMES=["🎲 おまかせ（全部混ぜる）","菊 — 色とりどり","🌸 桜 — ピンクの菊だけ",
+const THEMES=["🎲 おまかせ（毎回どれか1つ）","菊 — 色とりどり","🌸 桜 — ピンクの菊だけ",
               "銀世界 — 銀の菊だけ","牡丹","金の柳","蜂","渦蜂","千輪","型物"];
 
 createSim().then(mod=>{
@@ -161,8 +161,10 @@ function buildPanel(){
 function syncButtons(){
   if(!M) return;
   const left=api.get(0), total=api.get(1), phase=api.get(10);
+  const cur=THEMES[(api.get(13)|0)]||"";           // おまかせで実際に引かれたテーマ
+  const curShort=cur.replace(/ —.*$/,"");
   if(phase===1){
-    btnStar.textContent=`■ 停止  ${total-left}/${total} 発`;
+    btnStar.textContent=`■ 停止  ${curShort} ${total-left}/${total}`;
     btnStar.classList.add("running");
   }else if(phase===2){
     // 余韻中。空が空になってから静寂のカウントダウンが始まる
@@ -171,8 +173,9 @@ function syncButtons(){
                                                       : `🌙 余韻… ${q.toFixed(1)}s`;
     btnStar.classList.remove("running");
   }else{
-    const th=THEMES[(api.get(12)|0)] || "";
-    btnStar.textContent=`🎆 スターマイン ${th.replace(/ —.*$/,"")}`;
+    // 待機中は「選んでいるもの」を出す（おまかせなら "おまかせ" のまま）
+    const th=(THEMES[(api.get(12)|0)]||"").replace(/ —.*$/,"").replace(/（.*）/,"");
+    btnStar.textContent=`🎆 スターマイン ${th}`;
     btnStar.classList.remove("running");
   }
   const auto=api.get(5)>0.5;
@@ -194,7 +197,7 @@ function loop(ts){
   syncButtons();
   const ph=api.get(10);
   statusEl.textContent =
-    (ph===1 ? `🎆 連打中 ${(api.get(1)-api.get(0))|0}/${api.get(1)|0}   `
+    (ph===1 ? `🎆 ${(THEMES[(api.get(13)|0)]||"").replace(/ —.*$/,"")} ${(api.get(1)-api.get(0))|0}/${api.get(1)|0}   `
    : ph===2 ? `🌙 余韻   ` : ``) +
     `${fpsAvg.toFixed(0)} fps (x${n})   玉 ${api.get(4)|0} 発上昇中   星 ${api.get(2)|0} 個   ` +
     `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   引先 ${(api.get(8)*100).toFixed(0)}%   ` +

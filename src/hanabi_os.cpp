@@ -210,6 +210,7 @@ static long   frameNo = 0;
 // barPhase: 0=通常 1=連打中 2=余韻(空が空になるまで待ち、さらに静寂の時間だけ何も上げない)
 static int    barLeft = 0, barTotal = 0, barPhase = 0;
 static double barTimer = 0.0, quietTimer = 0.0;
+static int    curTheme = 1;      // この連打で実際に使うテーマ(おまかせはここで確定させる)
 
 // 粒子予算に対する負荷から引先の量を自動調整する係数(一次遅れ = 差分式)
 static double qual = 1.0;
@@ -393,7 +394,7 @@ static void burst(Shell& sh) {
     if (sh.type == T_BOTAN)  { tv = 1.10; tb = 0.75; tshed = 0.0; }   // 牡丹 — 尾を引かない
     if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
-    if (sh.type == T_UZU)    { tv = 0.34; tb = 1.85; tshed = 1.10; tthrust = 2.0; }  // 渦蜂
+    if (sh.type == T_UZU)    { tv = 0.82; tb = 1.75; tshed = 1.10; tthrust = 2.0; }  // 渦蜂
     if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
                        || is_shaped(sh.type)) ? 0 : sh.layers);
@@ -404,11 +405,11 @@ static void burst(Shell& sh) {
     if (gal < 1e-6) { gax = 0; gay = 1; gaz = 0; gal = 1; }
     gax /= gal; gay /= gal; gaz /= gal;
     double gsign = (rnd() < 0.5) ? -1.0 : 1.0;
-    double gomega = 1.15 + 0.85 * rnd();    // [rad/s] 玉ごとの渦の巻き速さ
+    double gomega = 5.0 + 2.5 * rnd();      // [rad/s] 玉ごとの渦の巻き速さ(約1回転/秒)
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
         // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
-        double tn = (sh.type == T_HACHI) ? 0.38 : (sh.type == T_UZU ? 0.24 : 1.0);
+        double tn = (sh.type == T_HACHI) ? 0.38 : (sh.type == T_UZU ? 0.42 : 1.0);
         int n = (int)(s.nstar * p_density * tn * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
         if (n < 8) n = 8;
         if (stars.size() + n > MAX_STARS) n = (int)(MAX_STARS - std::min(MAX_STARS, stars.size()));
@@ -509,7 +510,9 @@ static void burst(Shell& sh) {
                 // 回転が速すぎると推力が打ち消し合ってブルブルするだけになる。
                 // 0.1〜1回転/秒 くらいにすると、はっきりした輪を描いて飛ぶ
                 if (uzu) {
-                    st.thrust = (float)(95.0 + 55.0 * rnd());                  // 強い推力
+                    // 渦の半径 ≒ 推力/角速度^2。速く回して半径を数mに抑え、
+                    // 飛翔速度は高いままにするので、細かく巻きながら遠くまで飛ぶ
+                    st.thrust = (float)(230.0 + 190.0 * rnd());
                     st.spin   = (float)(gsign * gomega * (1.0 + rnds() * 0.10)); // 向きも速さも揃える
                 } else {
                     st.thrust = (float)(45.0 + 60.0 * rnd());                  // [m/s^2]
@@ -592,26 +595,13 @@ static int pick_type() {
     if (q < 0.95) return T_RING;
     return T_SATURN;
 }
-// 連打では千輪や型物は控えめに(子玉が増えすぎるし、形は単発でこそ映える)
-static int pick_type_mixed() {
-    double q = rnd();
-    if (q < 0.42) return T_KIKU;
-    if (q < 0.58) return T_BOTAN;
-    if (q < 0.68) return T_YANAGI;
-    if (q < 0.78) return T_HACHI;
-    if (q < 0.86) return T_UZU;
-    if (q < 0.92) return T_SENRIN;
-    if (q < 0.95) return T_HEART;
-    if (q < 0.98) return T_RING;
-    return T_SATURN;
-}
-
 // スターマインのテーマ。1テーマ = 1種類に揃えるので、菊とハートが混ざって濁らない。
-// type: -1=混成おまかせ / -2=型物からランダム / それ以外は T_* をそのまま
+// 添字 0 は「おまかせ」= 打ち上げ開始時に 1 以降からランダムに1つ選ぶ(全種類を混ぜはしない)。
+// type: -2=型物からランダム / それ以外は T_* をそのまま
 // fixc: FIXCOL の添字で炎色を固定(-1 で自由)
 struct Theme { int type; int fixc; };
 static const Theme THEMES[] = {
-    { -1, -1 },        // 0 おまかせ(全部混ぜる)
+    { T_KIKU,   -1 },  // 0 おまかせ(実際には下から1つ選ばれる。ここは保険)
     { T_KIKU,   -1 },  // 1 菊 — 色とりどり
     { T_KIKU,    0 },  // 2 桜 — ピンクの菊だけ
     { T_KIKU,    5 },  // 3 銀世界 — 銀の菊だけ
@@ -625,13 +615,12 @@ static const Theme THEMES[] = {
 static const int THEME_COUNT = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
 
 static void theme_pick(int& ty, int& fx) {
-    int ti = (int)(p_theme + 0.5);
-    if (ti < 0) ti = 0; if (ti >= THEME_COUNT) ti = THEME_COUNT - 1;
+    int ti = curTheme;
+    if (ti < 1) ti = 1; if (ti >= THEME_COUNT) ti = THEME_COUNT - 1;
     const Theme& th = THEMES[ti];
     fx = th.fixc;
-    if (th.type == -1)      ty = pick_type_mixed();
-    else if (th.type == -2) { const int s[3] = { T_HEART, T_RING, T_SATURN }; ty = s[(int)(rnd() * 3)]; }
-    else                    ty = th.type;
+    if (th.type == -2) { const int s[3] = { T_HEART, T_RING, T_SATURN }; ty = s[(int)(rnd() * 3)]; }
+    else               ty = th.type;
 }
 static void launch(double nx) { launch_ex(nx, p_go, pick_type()); }
 
@@ -641,6 +630,10 @@ static void start_barrage() {
     barTimer = 0.0;
     barPhase = 1;
     quietTimer = 0.0;
+    // おまかせ = 全種類を混ぜるのではなく、テーマを1つ引く(1発ごとではなく連打ごとに確定)
+    int ti = (int)(p_theme + 0.5);
+    curTheme = (ti <= 0) ? (1 + (int)(rnd() * (THEME_COUNT - 1))) : ti;
+    if (curTheme >= THEME_COUNT) curTheme = THEME_COUNT - 1;
 }
 
 // ---------------------------------------------------------------- ABI
@@ -710,6 +703,7 @@ KEEP double sim_get(int id) {
     case 10: return (double)barPhase;
     case 11: return quietTimer;
     case 12: return p_theme;
+    case 13: return (double)curTheme;    // この連打で実際に使われているテーマ
     }
     return 0.0;
 }
@@ -980,9 +974,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
         if (barrage && i % 30 == 0)
-            printf("  t=%5.1fs phase=%d bar=%3d/%-3d quiet=%4.1f shells=%2d stars=%5d sparks=%6d\n",
-                   sim_get(9), (int)sim_get(10), barTotal - barLeft, barTotal, sim_get(11),
-                   (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
+            printf("  t=%5.1fs phase=%d theme=%d bar=%3d/%-3d quiet=%4.1f shells=%2d stars=%5d sparks=%6d\n",
+                   sim_get(9), (int)sim_get(10), (int)sim_get(13), barTotal - barLeft, barTotal,
+                   sim_get(11), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3));
     }
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;
