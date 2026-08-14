@@ -243,6 +243,7 @@ static double p_rapid = 0.22;    // 連打間隔 [s]
 static double p_quiet = 6.0;     // 連打後の余韻(静寂)の長さ [s]
 static double p_starInt = 120.0; // 自動スターマインの間隔 [s] (0 で自動なし)
 static double p_hud = 1.0;       // 画面内の文字表示 (0 で花火だけ)
+static double p_crackle = 0.20;   // 消え際にパラパラ(分砲)する玉の割合 0〜1
 static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
 static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
 
@@ -476,7 +477,15 @@ static void burst(Shell sh) {
     if (sh.type == T_KAMURO) { tv = 0.40; tb = 2.30; tshed = 2.20; }
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
                        || sh.type == T_KAMURO || is_shaped(sh.type)) ? 0 : sh.layers);
-    bool crackle = (rnd() < 0.20);          // 消え際に分砲(パチパチ)する玉か
+    // 消え際の分砲(パラパラ) — 星の芯にクラッカー剤を仕込んだ玉。**玉ごとに決まる**
+    // (1つの玉の星は同じ組成なので、パラパラする玉とそうでない玉に分かれる。実物も同じ)。
+    //   型物 … 形が読めなくなるので入れない
+    //   蜂・渦蜂 … 推進が主役なので入れない
+    //   錦冠 … 金の簾の先で一斉に爆ぜる「先パラ」は定番の見せ場なので確率を上げる
+    // rnd() は必ず1回消費する(玉種で乱数の並びがずれないように)
+    double pcr = (is_shaped(sh.type) || sh.type == T_HACHI || sh.type == T_UZU) ? 0.0
+               : (sh.type == T_KAMURO ? std::min(1.0, p_crackle * 2.25) : p_crackle);
+    bool crackle = (rnd() < pcr);
 
     // 型物を並べる平面の向き。玉は飛びながら回っているので、開く向きは制御しきれない。
     // 観客向き(e1=X, e2=Y)を基準に、玉ごとにランダムな軸まわりにランダムな角度だけ傾ける。
@@ -885,6 +894,7 @@ KEEP void sim_set(int id, double v) {
         break;
     }
     case 13: p_hud = v; break;
+    case 14: p_crackle = v < 0 ? 0 : (v > 1 ? 1 : v); break;   // パラパラの割合
     }
 }
 
