@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 #include <algorithm>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -145,6 +146,8 @@ struct Star {
     float spinDelay;       // ノズルに火が回るまでの時間 [s]。それまでは普通の星として飛ぶ
     float exhaust;         // 噴射速度 [m/s]。火の粉はノズルの反対向きにこの速さで出る
     float delay;           // 暗飛行(点火までの時間)[s] — 飛んではいるが光らない
+    float sz;              // 描画上の大きさ(その玉の標準の星に対する半径の比)
+    float trail;           // 光を残光バッファへ入れる割合 (1=尾を引く星, 0=曳かない硬い星)
     bool  crackle;         // 消え際に分砲(パチパチ)する星か
     bool  alive;
 };
@@ -214,7 +217,14 @@ static std::vector<Shell> shells;
 static std::vector<Flash> flashes;
 static std::vector<Pending> pending;
 
-static std::vector<float>    acc;   // HDR 加算バッファ (RGB)
+// HDR 加算バッファ。2枚ある:
+//   acc  — 毎フレーム p_glow 倍に減衰させて溜める = **尾(引先)を引く**光
+//   accN — 毎フレーム消す                        = **尾を引かない**光
+// 実物の花星には、炭を含んで火の粉を曳きながら燃える星(菊の引先)と、
+// 曳かない硬い色星(牡丹・型物)がある。1枚のバッファだけだと、後者でも
+// 星の光そのものが残光として残ってしまい、長い筋に見えてしまう。
+static std::vector<float>    acc;
+static std::vector<float>    accN;
 static std::vector<uint32_t> px;    // 出力 RGBA
 static std::vector<uint32_t> bg;    // 夜空(静的)
 
@@ -299,12 +309,13 @@ static void build_bg() {
         uint32_t c = rgb(r, g, b);
         for (int i = 0; i < FW; ++i) bg[(size_t)j * FW + i] = c;
     }
-    // 星
-    for (int n = 0; n < 700; ++n) {
+    // 星。数を増やすと「プラネタリウムの天井」になってしまう。
+    // 花火大会の空は町明かりで、肉眼で見えるのは明るい星だけ
+    for (int n = 0; n < 240; ++n) {
         int i = (int)(rnd() * FW), j = (int)(rnd() * (horiz < FH ? horiz : FH));
         if (j < 0 || j >= FH) continue;
         double br = rnd(); br = br * br * br;
-        int v = (int)(40 + 215 * br);
+        int v = (int)(22 + 215 * br);
         uint32_t& d = bg[(size_t)j * FW + i];
         int r = std::min(255, (int)(d & 255) + v), g = std::min(255, (int)((d >> 8) & 255) + v);
         int b = std::min(255, (int)((d >> 16) & 255) + (int)(v * 1.05));
@@ -331,13 +342,13 @@ static void build_bg() {
 }
 
 // ---------------------------------------------------------------- 加算描画
-static inline void add_px(int i, int j, float r, float g, float b) {
+static inline void add_px(float* dst, int i, int j, float r, float g, float b) {
     if (i < 0 || j < 0 || i >= FW || j >= FH) return;
-    float* p = &acc[((size_t)j * FW + i) * 3];
+    float* p = &dst[((size_t)j * FW + i) * 3];
     p[0] += r; p[1] += g; p[2] += b;
 }
 // サブピクセル(バイリニア)で1点を加算 — 火の粉用
-static inline void splat_point(double sx, double sy, Col c, float amp) {
+static inline void splat_point(float* dst, double sx, double sy, Col c, float amp) {
     int ix = (int)floor(sx), iy = (int)floor(sy);
     if (ix < 0 || iy < 0 || ix >= FW - 1 || iy >= FH - 1) return;
     float fx = (float)(sx - ix), fy = (float)(sy - iy);
@@ -345,12 +356,12 @@ static inline void splat_point(double sx, double sy, Col c, float amp) {
     const int ox[4] = { 0,1,0,1 }, oy[4] = { 0,0,1,1 };
     for (int k = 0; k < 4; ++k) {
         float a = w[k] * amp;
-        add_px(ix + ox[k], iy + oy[k], c.r * a, c.g * a, c.b * a);
+        add_px(dst, ix + ox[k], iy + oy[k], c.r * a, c.g * a, c.b * a);
     }
 }
 // ガウス円盤 — 星頭・閃光用
-static inline void splat_disc(double sx, double sy, float rad, Col c, float amp) {
-    if (rad < 0.8f) { splat_point(sx, sy, c, amp); return; }
+static inline void splat_disc(float* dst, double sx, double sy, float rad, Col c, float amp) {
+    if (rad < 0.8f) { splat_point(dst, sx, sy, c, amp); return; }
     int R = (int)ceil(rad * 2.0f);
     if (R > 64) R = 64;
     int cx = (int)floor(sx), cy = (int)floor(sy);
@@ -361,7 +372,7 @@ static inline void splat_disc(double sx, double sy, float rad, Col c, float amp)
         float d2 = (px_ * px_ + py_ * py_) * inv;
         if (d2 > 4.0f) continue;
         float w = expf(-d2 * 1.6f) * amp;
-        add_px(cx + dx, cy + dy, c.r * w, c.g * w, c.b * w);
+        add_px(dst, cx + dx, cy + dy, c.r * w, c.g * w, c.b * w);
     }
 }
 
@@ -400,7 +411,10 @@ static void shape_point(int type, double u, double& sx, double& sy) {
 static void spawn_child(const Shell& p, double dx, double dy, double dz, double v,
                         double go, double fuse, int type);
 
-static void burst(Shell& sh) {
+// 玉が開く。**参照ではなく値で受ける。** 千輪はこの中で子玉を shells に push するので、
+// 呼び出し側が持っている shells 内への参照は再確保で無効になる(解放済みメモリへの書き込みになり、
+// 実際に落ちていた)。死亡の印は呼び出し側で付ける。
+static void burst(Shell sh) {
     const ShellSpec& s = sh.sp;
 
     // 千輪 — 星ではなく子玉を撒く。子玉は短い秒時で、少し遅れて一斉に小さく開く
@@ -426,13 +440,18 @@ static void burst(Shell& sh) {
 
     // 玉種による味付け。物理量(初速・燃焼時間・剥離量・推力)を変えるだけで見た目は勝手に変わる
     double tv = 1.0, tb = 1.0, tshed = 1.0, tthrust = 0.0;
+    // 星が引先(尾)を曳くか。牡丹と型物は炭を含まない硬い色星なので曳かない。
+    // 曳かない星は残光バッファに入れない = 尾のない丸い点として写る(実物もほぼ球)。
+    // 0.05〜0.1 にすると、動きのぶれぶんだけ短い筋が残る。
+    // **千輪の子玉(gen>0)は対象外** — 元の見え方のほうがよいという判断で尾を残す
+    double ttrail = (sh.gen == 0 && (sh.type == T_BOTAN || is_shaped(sh.type))) ? 0.0 : 1.0;
     if (sh.type == T_BOTAN)  { tv = 1.10; tb = 0.75; tshed = 0.0; }   // 牡丹 — 尾を引かない
     if (sh.type == T_YANAGI) { tv = 0.48; tb = 1.95; tshed = 1.7; }   // 柳   — 低速で長く燃え垂れる
     // 蜂の類は推進薬を推力と回転に使い切るので、燃焼は短い(1.5〜2秒)。光る時間も短い
     if (sh.type == T_HACHI)  { tv = 0.50; tb = 1.45; tshed = 0.85; tthrust = 1.0; }  // 蜂
     // 渦蜂は「まっすぐ飛ぶ 1〜2秒」＋「回る 1.5〜2秒」なので、燃焼はその合計ぶん要る
     if (sh.type == T_UZU)    { tv = 0.90; tb = 0.80; tshed = 3.60; tthrust = 2.0; }  // 渦蜂
-    if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.24; } // 型物 — 形が読めるよう尾は短く
+    if (is_shaped(sh.type))  { tv = 1.00; tb = 0.68; tshed = 0.10; } // 型物 — 形が読めるよう尾は短く
     // 錦冠(金冠) — 柳をうんと強くしたもの。低速・超長燃焼で地面近くまで垂れる
     if (sh.type == T_KAMURO) { tv = 0.40; tb = 2.30; tshed = 2.20; }
     int layers = 1 + ((sh.type == T_YANAGI || sh.type == T_HACHI || sh.type == T_UZU
@@ -475,8 +494,12 @@ static void burst(Shell& sh) {
     double gdelay = 1.0 + 0.9 * rnd();      // [s] 割れてからノズルに火が回るまで
     for (int L = 0; L < layers; ++L) {
         double vscale = (L == 0) ? 1.0 : (0.62 - 0.20 * (L - 1));   // 芯は内側 = 遅い
-        // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)
-        double tn = (sh.type == T_HACHI) ? 0.38 : (sh.type == T_UZU ? 0.42 : 1.0);
+        // 蜂は1個1個の軌跡を見せたいので星数を減らす(実物も星数は少ない)。
+        // 型物も同じ理由で少ない。菊と同じ星数を輪郭の線上に並べると、
+        // 点が細かすぎて「光る細線」になってしまい、実物の型物のように見えない。
+        // 実物は**数十個の大きな星**を輪郭に置く(そうしないと形が保たない)。
+        double tn = (sh.type == T_HACHI) ? 0.38 : (sh.type == T_UZU ? 0.42
+                    : (is_shaped(sh.type) ? 0.18 : 1.0));
         int n = (int)(s.nstar * p_density * tn * (L == 0 ? 1.0 : 0.45 + 0.1 * L));
         if (n < 8) n = 8;
         if (stars.size() + n > MAX_STARS) n = (int)(MAX_STARS - std::min(MAX_STARS, stars.size()));
@@ -488,7 +511,11 @@ static void burst(Shell& sh) {
         // 玉ごとにランダムに回した フィボナッチ球 = 星の配置
         double a1 = rnd() * 6.2831853, a2 = rnd() * 6.2831853;
         double ca1 = cos(a1), sa1 = sin(a1), ca2 = cos(a2), sa2 = sin(a2);
-        double rstar = s.starR * (L == 0 ? 1.0 : 0.82);
+        // 型物は星が大きい。大きい星は弾道係数 k = 0.8636/(4 ρs r) が小さい = 減速しにくいので、
+        // 形が崩れにくく遠くまで開く(実物が大きい星を使う理由でもある)。
+        // szK は描画上の大きさにも掛ける(下の st.sz)。1.0 のままなら見た目は今までどおり
+        double szK = is_shaped(sh.type) ? 2.40 : 1.0;
+        double rstar = s.starR * szK * (L == 0 ? 1.0 : 0.82);
         double burnT = s.burnT * (L == 0 ? 1.0 : 0.8) * tb;
         if (sh.type == T_YANAGI) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
         if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.4f; tail = C_GOLD; }
@@ -554,6 +581,8 @@ static void burst(Shell& sh) {
             }
             st.shedRate = (float)(115.0 * p_shed * tshed);
             st.delay = (L == 0) ? 0.0f : (float)(0.10 + 0.16 * L);   // 芯は少し遅れて点火(時差開発)
+            st.sz = (float)szK;
+            st.trail = (float)ttrail;
             st.crackle = crackle;
             st.thrust = 0.0f; st.spin = 0.0f; st.spinB = 0.0f; st.sphase = 0.0f;
             st.spinDelay = 0.0f; st.exhaust = 0.0f;
@@ -772,6 +801,7 @@ KEEP void sim_reset() {
     stars.clear(); sparks.clear(); shells.clear(); flashes.clear(); pending.clear();
     stars.reserve(20000); sparks.reserve(60000);
     acc.assign((size_t)FW * FH * 3, 0.0f);
+    accN.assign((size_t)FW * FH * 3, 0.0f);
     simTime = 0; launchTimer = 0.4; frameNo = 0;
     measH = 0; measD = 0;
     barLeft = barTotal = barPhase = 0; barTimer = 0; quietTimer = 0; qual = 1.0;
@@ -781,7 +811,16 @@ KEEP void sim_reset() {
     build_bg();
 }
 
-KEEP int sim_init(int, int) {
+// seed に 0 を渡すと**時計から種を撒く**。ブラウザは毎回ちがう花火になる。
+// 非 0 ならその値を種にする = 何度でも同じ絵になる(ネイティブ自己テストはこちら。
+// 変更の前後を絵の一致で確かめられるようにしておきたいので、再現できる道を残す)
+KEEP int sim_init(int seed, int) {
+    if (seed == 0) {
+        uint64_t t = (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
+        seed = (int)(t ^ (t >> 32));
+    }
+    rng = (uint32_t)seed | 1u;             // xorshift は 0 を種にできない
+    for (int i = 0; i < 8; ++i) rnd();     // 種の偏りを流す
     px.assign((size_t)FW * FH, 0);
     sim_reset();
     return 1;
@@ -959,7 +998,10 @@ KEEP void sim_step(int frames) {
                 if (sh.y > measH) measH = sh.y;   // 到達高度は積分の結果
                 sh.fuse -= dt;                    // 時限導火線が焼ける
                 // 親玉は秒時が狂っても落下し始めたら開く。子玉(千輪)は下向きに撒かれるので秒時のみ
-                if (sh.fuse <= 0.0 || (sh.gen == 0 && sh.vy < -12.0)) burst(sh);
+                if (sh.fuse <= 0.0 || (sh.gen == 0 && sh.vy < -12.0)) {
+                    shells[i].alive = false;   // 印は burst() に入る前に付ける
+                    burst(shells[i]);          // 値で渡す(この中で shells が再確保されうる)
+                }
             }
             for (size_t i = 0; i < shells.size();) {
                 if (!shells[i].alive) { shells[i] = shells.back(); shells.pop_back(); }
@@ -1074,6 +1116,7 @@ KEEP uint8_t* sim_render() {
     float dec = (float)p_glow;
     size_t n3 = acc.size();
     for (size_t i = 0; i < n3; ++i) acc[i] *= dec;
+    std::fill(accN.begin(), accN.end(), 0.0f);      // 尾を引かない光は毎フレーム消す
 
     // 火の粉 — 燃え尽きるにつれて暗く、赤く冷える
     for (size_t i = 0; i < sparks.size(); ++i) {
@@ -1083,7 +1126,7 @@ KEEP uint8_t* sim_render() {
         float lf = s.life / s.life0;
         Col c = mixc({ 0.95f, 0.16f, 0.03f }, s.c, lf);
         float amp = 0.34f * lf * lf * (float)(sc / camF * 520.0);
-        splat_point(sx, sy, c, amp);
+        splat_point(acc.data(), sx, sy, c, amp);
     }
 
     // 星頭 — 輝度は燃焼表面積 (r/r0)^2 に比例
@@ -1096,7 +1139,18 @@ KEEP uint8_t* sim_render() {
         Col c = (prog < st.chg) ? st.c0 : st.c1;
         float f = (float)((st.r / st.r0) * (st.r / st.r0));
         float amp = (0.9f + 2.6f * f) * (float)(sc / camF * 520.0);
-        splat_disc(sx, sy, 1.0f + 1.4f * f, c, amp);
+        // 星が大きいほど点も大きく写る。amp(ピークの明るさ)はそのままなので、
+        // 総光量は半径の2乗で増える = 燃焼表面積に比例する(型物の大きい星が明るいのはこれ)
+        float rad = (1.0f + 1.4f * f) * st.sz;
+        // 尾を引く星は残光バッファへ、曳かない星は毎フレーム消える側へ
+        if (st.trail >= 0.999f) {
+            splat_disc(acc.data(), sx, sy, rad, c, amp);
+        } else if (st.trail <= 0.001f) {
+            splat_disc(accN.data(), sx, sy, rad, c, amp);
+        } else {
+            splat_disc(acc.data(),  sx, sy, rad, c, amp * st.trail);
+            splat_disc(accN.data(), sx, sy, rad, c, amp * (1.0f - st.trail));
+        }
     }
 
     // 開発の閃光
@@ -1105,7 +1159,7 @@ KEEP uint8_t* sim_render() {
         double sx, sy, sc;
         if (!project(fl.x, fl.y, fl.z, sx, sy, sc)) continue;
         float t = (float)(fl.t / fl.t0);
-        splat_disc(sx, sy, (float)(fl.pw * t), { 1.0f, 0.92f, 0.72f }, 2.2f * t * t);
+        splat_disc(acc.data(), sx, sy, (float)(fl.pw * t), { 1.0f, 0.92f, 0.72f }, 2.2f * t * t);
     }
 
     // トーンマップして夜空に合成
@@ -1120,7 +1174,8 @@ KEEP uint8_t* sim_render() {
     // 実物に近かった。同じ式でも題材で結論が変わるので、両方ビルドして
     // compare.html で見比べられるようにしてある。
     for (size_t i = 0, np = (size_t)FW * FH; i < np; ++i) {
-        float r = acc[i * 3], g = acc[i * 3 + 1], b = acc[i * 3 + 2];
+        float r = acc[i * 3] + accN[i * 3], g = acc[i * 3 + 1] + accN[i * 3 + 1],
+              b = acc[i * 3 + 2] + accN[i * 3 + 2];
         if (r + g + b < 0.004f) { px[i] = bg[i]; continue; }
 #ifdef LIGHT_VIVID
         float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
@@ -1170,7 +1225,7 @@ KEEP uint8_t* sim_render() {
 #include <cstdio>
 #include <cstdlib>
 int main(int argc, char** argv) {
-    sim_init(0, 0);
+    sim_init(20240807, 0);   // 種を固定 = 同じ絵が撮れる(比較用)
     int steps = argc > 1 ? atoi(argv[1]) : 480;
     const char* out = argc > 2 ? argv[2] : "hanabi_preview.png";
     int barrage = argc > 3 ? atoi(argv[3]) : 0;   // 4番目の引数 = スターマインの発数
