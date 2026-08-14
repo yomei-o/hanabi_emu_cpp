@@ -47,6 +47,11 @@ static const size_t MAX_STARS = 120000;
 static uint32_t rng = 88675123u;
 static inline double rnd() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (rng & 0xFFFFFF) / (double)0x1000000; }
 static inline double rnds() { return rnd() * 2.0 - 1.0; }
+static inline float smoothstep(float a, float b, float x) {
+    float t = (x - a) / (b - a);
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    return t * t * (3.0f - 2.0f * t);
+}
 static inline uint32_t rgb(int r, int g, int b) {
     return 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
 }
@@ -1104,12 +1109,28 @@ KEEP uint8_t* sim_render() {
     }
 
     // トーンマップして夜空に合成
+    //
+    // ここは **-DLIGHT_LEGACY で昔の式に戻せる**ようにしてある(比較デモ用)。
+    // 昔は成分ごとに r/(1+r) をかけていた。明るいところから順に色が抜けるので、
+    // 菊の火の筋が全部クリーム色になり、色は暗い先端にしか残らなかった。
+    // いまは明るさ(最大成分)だけ圧縮して色の向きは保ち、飽和する芯だけ白へ寄せる。
+    // 実際の写真でも、燃えている星の芯は白く飛び、そこから色の付いた筋が伸びる。
     for (size_t i = 0, np = (size_t)FW * FH; i < np; ++i) {
         float r = acc[i * 3], g = acc[i * 3 + 1], b = acc[i * 3 + 2];
         if (r + g + b < 0.004f) { px[i] = bg[i]; continue; }
+#ifdef LIGHT_LEGACY
         int R = (int)(255.0f * (r / (1.0f + r)));
         int G = (int)(255.0f * (g / (1.0f + g)));
         int B = (int)(255.0f * (b / (1.0f + b)));
+#else
+        float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        float t = mx / (1.0f + mx);           // 圧縮した明るさ
+        float s = t / mx;                     // 色の向きを保ったまま合わせる倍率
+        float wht = smoothstep(4.0f, 16.0f, mx);   // ここから上は飛んで白くなる
+        int R = (int)(255.0f * (r * s + (t - r * s) * wht));
+        int G = (int)(255.0f * (g * s + (t - g * s) * wht));
+        int B = (int)(255.0f * (b * s + (t - b * s) * wht));
+#endif
         uint32_t d = bg[i];
         R += (int)(d & 255); G += (int)((d >> 8) & 255); B += (int)((d >> 16) & 255);
         px[i] = rgb(R > 255 ? 255 : R, G > 255 ? 255 : G, B > 255 ? 255 : B);

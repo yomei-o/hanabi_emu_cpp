@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hanabi OS - 光り方の新旧比較 (C++/WASM)</title>
+<style>
+  :root{ --fg:#ffb347; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#05050a; color:var(--fg); font-family:'Courier New',monospace;
+        min-height:100vh; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px; }
+  h1{ font-size:16px; margin:0; font-weight:700; }
+  .sub{ font-size:12px; color:#c08a52; max-width:960px; text-align:center; line-height:1.6; }
+  canvas{ width:min(96vw,960px); height:auto; image-rendering:pixelated; background:#05050a;
+          border:1px solid #533; border-radius:6px; box-shadow:0 6px 26px #000a; cursor:ew-resize;
+          touch-action:none; }
+  #panel{ display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:center; max-width:960px; }
+  .ctl{ display:flex; flex-direction:column; font-size:11px; color:#c08a52; min-width:150px; }
+  .ctl b{ color:var(--fg); }
+  input[type=range]{ accent-color:var(--fg); }
+  select{ font-family:inherit; font-size:12px; margin-top:3px; padding:4px 6px; border-radius:5px;
+          background:#201408; color:var(--fg); border:1px solid #a63; }
+  button{ font-family:inherit; font-size:13px; padding:7px 13px; border:1px solid #a63; border-radius:6px;
+          background:#201408; color:var(--fg); cursor:pointer; min-width:170px; transition:background .12s; }
+  button:hover{ background:#33200c; }
+  button.hit{ background:#ffd9a0; color:#13100a; }
+  button.primary{ background:var(--fg); color:#13100a; border:none; font-weight:700; }
+  button.running{ background:#a33; border-color:#f66; color:#ffe; }
+  #status{ font-size:12px; color:#c08a52; font-variant-numeric:tabular-nums; min-height:1.2em; }
+  a{ color:var(--fg); }
+  code{ color:#ffd9a0; }
+  body.fs{ padding:0; background:#000; gap:0; }
+  body.fs h1, body.fs .sub, body.fs #panel, body.fs #status{ display:none; }
+  body.fs canvas{ position:fixed; inset:0; width:100vw; height:100vh; max-width:none;
+                  object-fit:contain; border:none; border-radius:0; box-shadow:none; background:#000; }
+</style>
+</head>
+<body>
+  <h1>🎆 光り方の新旧比較 <span style="color:#c08a52;font-size:12px">(C++ / WASM)</span></h1>
+  <p class="sub">
+    <b>同じ1本のソースを、トーンマップだけ変えて2回ビルドしたもの</b>を左右に並べています
+    （<code>./build.sh hanabi_os</code> と <code>./build.sh hanabi_os legacy</code>）。
+    物理も乱数の種も同じで、両方に同じ操作を送っているので、<b>違いは光り方だけ</b>です。<br>
+    <b>左（旧）</b>は加算した光を成分ごとに <code>r/(1+r)</code> で圧縮していました。明るいところから
+    順に色が抜けるので、菊の火の筋が全部クリーム色になり、色は暗い先端にしか残りません。<br>
+    <b>右（新）</b>は明るさ（最大成分）だけ圧縮して色の向きは保ち、飽和する芯だけ白へ寄せます。
+    実際の写真でも、燃えている星の芯は白く飛び、そこから色の付いた筋が伸びます。<br>
+    <b>画面を左右にドラッグすると境目が動きます。</b>まず <b>🎆 スターマイン</b> を押してください。
+  </p>
+  <canvas id="cv"></canvas>
+  <div id="panel"></div>
+  <div id="status">読み込み中…</div>
+  <p class="sub">
+    ふつうのデモ: <a href="./">hanabi_os</a> ／
+    ソース: <a href="https://github.com/yomei-o/hanabi_emu_cpp">github.com/yomei-o/hanabi_emu_cpp</a>
+  </p>
+
+<!-- sim*.js / sim*.wasm はファイル名が変わらないので、ブラウザが古いものを 10 分使い回す
+     (GitHub Pages の Cache-Control: max-age=600)。更新したら v を上げる。 -->
+<script src="sim.js?v=1"></script>
+<script src="sim_legacy.js?v=1"></script>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
+let A=null, B=null;            // A=新しい光, B=昔の光
+let apiA={}, apiB={}, W=0, H=0, img=null, playing=true, lastT=0, fpsAvg=0, lag=0;
+let divX=0;                    // 境目(画素)
+let btnStar=null, btnPlay=null;
+const THEMES=["🎲 おまかせ","菊","🌸 桜","銀世界","牡丹","金の柳","蜂","渦蜂","千輪","型物","🏅 錦冠","🔥 フェニックス"];
+const SLIDERS=[
+  { id:0, label:"号数 (寸)",   min:3, max:10, step:1, val:5, dec:0 },
+  { id:6, label:"残光",        min:0.60, max:0.94, step:0.01, val:0.82, dec:2 },
+  { id:7, label:"連打の発数",  min:20, max:300, step:10, val:100, dec:0 },
+  { id:12,label:"自動スターマイン [s] (0でOFF)", min:0, max:600, step:10, val:120, dec:0 },
+];
+
+const wrap=(mod)=>({
+  init:mod.cwrap("sim_init","number",["number","number"]),
+  w:mod.cwrap("sim_w","number",[]), h:mod.cwrap("sim_h","number",[]),
+  reset:mod.cwrap("sim_reset",null,[]), step:mod.cwrap("sim_step",null,["number"]),
+  render:mod.cwrap("sim_render","number",[]), click:mod.cwrap("sim_click",null,["number","number"]),
+  set:mod.cwrap("sim_set",null,["number","number"]), action:mod.cwrap("sim_action",null,["number"]),
+  get:mod.cwrap("sim_get","number",["number"]),
+});
+
+Promise.all([
+  createSim({locateFile:(p,dir)=>dir+p+"?v=1"}),
+  createSimLegacy({locateFile:(p,dir)=>dir+p+"?v=1"}),
+]).then(([a,b])=>{
+  A=a; B=b; apiA=wrap(a); apiB=wrap(b);
+  apiA.init(0,0); apiB.init(0,0);
+  W=apiA.w(); H=apiA.h(); cv.width=W; cv.height=H; img=ctx.createImageData(W,H);
+  divX=W>>1;
+  both(x=>x.set(13,0));                 // C++ 側の HUD 文字は消す(2つ重なると読めない)
+  SLIDERS.forEach(s=>both(x=>x.set(s.id,s.val)));
+  buildPanel();
+  loop();
+});
+
+// 2つのシムには必ず同じ操作を同じ順で送る。これを守っている限り、
+// 物理も乱数も同じなので、絵の違いはトーンマップだけになる
+function both(fn){ fn(apiA); fn(apiB); }
+
+function buildPanel(){
+  const hit=b=>{ b.classList.add("hit"); setTimeout(()=>b.classList.remove("hit"),160); };
+  const mk=(t,c)=>{ const b=document.createElement("button"); b.textContent=t;
+                    if(c)b.className=c; panel.appendChild(b); return b; };
+  const onPress=(b,fn)=>{ let last=0;
+    const run=()=>{ const n=performance.now(); if(n-last<300)return; last=n; hit(b); if(A)fn(); };
+    b.addEventListener("pointerdown",run); b.addEventListener("click",run); };
+
+  const selWrap=document.createElement("label"); selWrap.className="ctl"; selWrap.style.minWidth="200px";
+  selWrap.innerHTML="<span>スターマインのテーマ</span>";
+  const sel=document.createElement("select");
+  THEMES.forEach((t,i)=>{ const o=document.createElement("option"); o.value=String(i); o.textContent=t; sel.appendChild(o); });
+  sel.value="0";
+  sel.addEventListener("change",()=>both(x=>x.set(11,+sel.value)));
+  selWrap.appendChild(sel); panel.appendChild(selWrap);
+
+  SLIDERS.forEach(s=>{
+    const w=document.createElement("label"); w.className="ctl";
+    const head=document.createElement("span");
+    head.innerHTML=`${s.label} <b id="v${s.id}">${(+s.val).toFixed(s.dec)}</b>`;
+    const inp=document.createElement("input"); inp.type="range";
+    inp.min=s.min; inp.max=s.max; inp.step=s.step; inp.value=s.val;
+    inp.addEventListener("input",()=>{ $("v"+s.id).textContent=(+inp.value).toFixed(s.dec);
+                                       both(x=>x.set(s.id,+inp.value)); });
+    w.appendChild(head); w.appendChild(inp); panel.appendChild(w);
+  });
+
+  btnStar=mk("🎆 スターマイン 連打");
+  // 送る番号は先に1回だけ決める。both() の中で apiA.get() を読むと、
+  // A に action(3) を送った時点で phase が変わり、B には action(4)=停止 が飛んで
+  // 2本がずれてしまう(比較の前提が壊れる)
+  onPress(btnStar,()=>{ const id = apiA.get(10)===1 ? 4 : 3; both(x=>x.action(id)); });
+  onPress(mk("🎇 1発打ち上げ"),()=>both(x=>x.action(0)));
+  onPress(mk("⛶ フルスクリーン"),()=>toggleFs());
+  btnPlay=mk("⏸ 一時停止","primary");
+  onPress(btnPlay,()=>{ playing=!playing;
+    btnPlay.textContent = playing?"⏸ 一時停止":"▶ 再生"; if(playing){lastT=0;loop();} });
+  onPress(mk("⟲ リセット"),()=>{ both(x=>x.reset()); both(x=>x.set(13,0));
+                                 SLIDERS.forEach(s=>both(x=>x.set(s.id,s.val))); });
+}
+
+// 境目のドラッグ
+const setDiv=e=>{ const r=cv.getBoundingClientRect();
+                  divX=Math.max(0,Math.min(W,Math.round((e.clientX-r.left)/r.width*W))); };
+let dragging=false;
+cv.addEventListener("pointerdown",e=>{ dragging=true; setDiv(e); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove",e=>{ if(dragging) setDiv(e); });
+cv.addEventListener("pointerup",()=>{ dragging=false; });
+
+function applyFs(on){ document.body.classList.toggle("fs",on); }
+function toggleFs(){
+  if(document.fullscreenElement) document.exitFullscreen();
+  else (document.documentElement.requestFullscreen?.()||Promise.reject())
+        .catch(()=>applyFs(!document.body.classList.contains("fs")));
+}
+document.addEventListener("fullscreenchange",()=>applyFs(!!document.fullscreenElement));
+window.addEventListener("keydown",e=>{ if(e.key==="f"||e.key==="F") toggleFs(); });
+
+// 左を旧、右を新で貼り合わせる。行ごとに 2回コピーするだけ
+function blitWipe(pA,pB){
+  const ha=A.HEAPU8, hb=B.HEAPU8, d=img.data, rowB=W*4, cut=divX*4;
+  for(let y=0;y<H;y++){
+    const o=y*rowB;
+    if(cut>0)     d.set(hb.subarray(pB+o,      pB+o+cut),  o);
+    if(cut<rowB)  d.set(ha.subarray(pA+o+cut,  pA+o+rowB), o+cut);
+  }
+  ctx.putImageData(img,0,0);
+  // 境目とラベル
+  ctx.fillStyle="rgba(255,179,71,0.85)"; ctx.fillRect(divX-1,0,2,H);
+  ctx.font="bold 15px 'Courier New',monospace"; ctx.textBaseline="top";
+  ctx.fillStyle="rgba(255,215,170,0.95)";
+  if(divX>150) ctx.fillText("旧: 成分ごとに圧縮",12,10);
+  if(divX<W-170){ ctx.textAlign="right"; ctx.fillText("新: 明るさだけ圧縮",W-12,10); ctx.textAlign="left"; }
+}
+
+function loop(ts){
+  if(!playing) return;
+  if(lastT){ lag+=Math.min(120,ts-lastT); const f=1000/(ts-lastT); fpsAvg=fpsAvg?fpsAvg*0.9+f*0.1:f; }
+  lastT=ts;
+  let n=Math.max(1,Math.min(3,Math.round(lag/16.667)));
+  lag=Math.max(0,lag-n*16.667);
+  both(x=>x.step(n));
+  blitWipe(apiA.render(), apiB.render());
+  const phase=apiA.get(10);
+  btnStar.classList.toggle("running", phase===1);
+  btnStar.textContent = phase===1 ? `■ 停止  ${apiA.get(1)-apiA.get(0)}/${apiA.get(1)}`
+                                  : "🎆 スターマイン 連打";
+  setText(statusEl,
+    `${fpsAvg.toFixed(0)} fps (x${n})   星 ${apiA.get(2)|0}   火の粉 ${apiA.get(3)|0}   玉 ${apiA.get(4)|0}   ` +
+    `／ 2本同時に走らせています(連打の山では 1本 18ms なので 25〜30fps)`);
+  requestAnimationFrame(loop);
+}
+function setText(el,s){ if(el.textContent!==s) el.textContent=s; }
+</script>
+</body>
+</html>

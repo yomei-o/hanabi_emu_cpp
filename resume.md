@@ -27,6 +27,10 @@ clang++ -O3 -std=c++17 -I. src/hanabi_os.cpp -o /tmp/hanabi   # g++ 不可(C99 �
 /tmp/hanabi 620 /tmp/climax.png 100    # 引数: フレーム数 出力PNG [連発数] [玉の種類]
 /tmp/hanabi 500 /tmp/hachi.png 0 4     # 玉の種類: -1=おまかせ 0菊 1牡丹 2柳 3蜂 4渦蜂 5千輪 6♡ 7輪 8土星
 /tmp/hanabi 640 /tmp/sakura.png 100 -1 2   # 6番目 = テーマ(0おまかせ 1菊 2桜 3銀 4牡丹 5柳 6蜂 7渦蜂 8千輪 9型物)
+
+# 昔の光(成分ごとのトーンマップ)でビルドして比べる
+clang++ -O3 -std=c++17 -DLIGHT_LEGACY -I. src/hanabi_os.cpp -o /tmp/hanabi_legacy
+EMSDK=~/emsdk ./build.sh hanabi_os legacy   # -> wasmdist/hanabi_os/sim_legacy.js (createSimLegacy)
 ```
 
 ## ファイル
@@ -36,8 +40,22 @@ clang++ -O3 -std=c++17 -I. src/hanabi_os.cpp -o /tmp/hanabi   # g++ 不可(C99 �
 | `src/hanabi_os.cpp` | 物理・描画すべて（これ1本。約660行） |
 | `build.sh` | emcc ラッパ。`EXPORTED_FUNCTIONS` に `_sim_get` を追加してある |
 | `wasmdist/hanabi_os/index.html` | JSハーネス（universe_cpp のものにボタン状態表示を追加） |
+| `wasmdist/hanabi_os/compare.html` | **光り方の新旧比較**（新旧2つの wasm を同時に読んで左右で貼り合わせ） |
 | `olive.c` / `stb_image_write.h` | 描画（テキストのみ）/ ネイティブPNG出力 |
 | `preview_*.png` | README 用（5号／クライマックス／蜂／千輪／ハート／土星） |
+
+## 光り方（2026-08-14 に直した。`-DLIGHT_LEGACY` で戻せる）
+
+**トーンマップは成分ごとにやってはいけない。** `r/(1+r)` を R,G,B 別々にかけると明るいところ
+から順に色が抜け、**菊の火の筋が全部クリーム色**になっていた（色は暗い先端にしか残らない）。
+いまは**明るさ(最大成分)だけ**圧縮して色の向きは保ち、`smoothstep(4,16,mx)` で芯だけ白へ寄せる。
+`drone_emu_cpp` で同じ症状を直したのがきっかけ。加算バッファ＋トーンマップの repo は同じ穴を持つ。
+
+**比較ページ (`compare.html`) の前提**: 2本の wasm に同じ操作を同じ順で送れば、物理も乱数も
+同じなので絵の違いは光り方だけになる。node で 900フレーム検証済み（星・火の粉・玉・時刻・連打の
+残りが完全一致、画素差は最大 88 / 面積 21.6%）。**操作の値は先に1回決めて両方に送る**
+（`both()` の中で `get()` を読むと、片方に送った時点で状態が変わって2本がずれる。実際に踏んだ）。
+負荷は1本 18ms/フレーム（連打の山、星2000・火の粉82000）なので、2本で 25〜30fps。
 
 ## 設計の要点（ここを崩さない）
 
