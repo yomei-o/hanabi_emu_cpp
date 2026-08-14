@@ -281,17 +281,37 @@ static inline Col mixc(Col a, Col b, float t) {
 }
 // 色替わり(変化菊)を含む配色表
 static void scheme_colors(int s, int layer, Col& c0, Col& c1, float& chg, Col& tail) {
-    static const Col tbl[] = { C_RED, C_GREEN, C_BLUE, C_LEMON, C_SILVER, C_PURPLE };
+    // 単色の玉に使う炎色。紅・銀・緑・青が多く、黄と紫は少ない(実際の出方に合わせて重みを付ける)
+    static const Col tbl[] = { C_RED, C_RED, C_SILVER, C_SILVER, C_GREEN, C_GREEN,
+                               C_BLUE, C_BLUE, C_LEMON, C_PURPLE };
+    static const int NTBL = (int)(sizeof(tbl) / sizeof(tbl[0]));
+    // 変化菊(色が変わる菊)の取り合わせ。**適当な2色ではない。**
+    // 星は層になっていて外側から順に燃えるので、作り手が組んだ対でしか変化しない。
+    // 実際に使われるのは「銀や色から紅へ」「色から銀へ」「金から紅(菊先紅)」あたり
+    static const Col pair[][2] = {
+        { C_SILVER, C_RED    },   // 銀 → 紅   いちばん多い
+        { C_SILVER, C_RED    },
+        { C_RED,    C_SILVER },   // 紅 → 銀
+        { C_GREEN,  C_RED    },   // 緑 → 紅
+        { C_BLUE,   C_SILVER },   // 青 → 銀
+        { C_LEMON,  C_RED    },   // 黄 → 紅
+        { C_PURPLE, C_SILVER },   // 紫 → 銀
+        { C_GOLD,   C_RED    },   // 金 → 紅   菊先紅
+        { C_SILVER, C_GREEN  },   // 銀 → 緑
+        { C_RED,    C_GOLD   },   // 紅 → 金
+    };
+    static const int NPAIR = (int)(sizeof(pair) / sizeof(pair[0]));
     switch (s) {
     case 0: // 錦冠 — 木炭の金一色。菊の基本形
         c0 = C_GOLD; c1 = C_AMBER; chg = 0.55f; tail = C_GOLD; break;
     case 1: // 単色 + 金の引先
-        c0 = tbl[(int)(rnd() * 6)]; c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.38f); break;
-    case 2: // 変化菊 — 途中で色が変わる
-        c0 = tbl[(int)(rnd() * 6)]; c1 = tbl[(int)(rnd() * 6)]; chg = 0.5f;
-        tail = mixc(c0, C_GOLD, 0.35f); break;
+        c0 = tbl[(int)(rnd() * NTBL)]; c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.38f); break;
+    case 2: { // 変化菊 — 決まった取り合わせで途中から色が変わる
+        int k = (int)(rnd() * NPAIR);
+        c0 = pair[k][0]; c1 = pair[k][1]; chg = 0.5f;
+        tail = mixc(c0, C_GOLD, 0.35f); break; }
     default: // 芯替わり — 層ごとに別の色
-        c0 = tbl[(layer * 2 + 1) % 6]; c1 = c0; chg = 1.0f;
+        c0 = tbl[(layer * 3 + 2) % NTBL]; c1 = c0; chg = 1.0f;
         tail = mixc(c0, C_GOLD, 0.35f); break;
     }
     if (s >= 3 && layer == 0) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.6f; tail = C_GOLD; }
@@ -683,8 +703,15 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int
     sh.gen = 0;
     sh.fixc = fixc;
     sh.layers = (int)(p_layers + 0.5);
+    // 色の出方。**二色に変わる菊(変化菊)を基本にする。**
+    // 金一色(錦)を厚くすると、上がる玉のほとんどがオレンジに見えてしまう。
+    // 実際の大会でも、色変わりの菊と牡丹が主で、金は見せ場に混ぜる。
     double q = rnd();
-    sh.scheme = (sh.layers > 0 && q < 0.30) ? 3 : (q < 0.55 ? 0 : (q < 0.85 ? 1 : 2));
+    if (sh.layers > 0 && q < 0.20) sh.scheme = 3;   // 芯替わり(層ごとに色)      20%
+    else if (q < 0.20)             sh.scheme = 2;   // 芯がないぶんは変化菊へ
+    else if (q < 0.30)             sh.scheme = 0;   // 金一色(錦)               10%
+    else if (q < 0.55)             sh.scheme = 1;   // 単色 + 金の引先          25%
+    else                           sh.scheme = 2;   // 変化菊(二色)             45%
     if (is_shaped(type)) sh.scheme = 1;              // 型物は形が読めるよう単色に
     sh.alive = true;
     shells.push_back(sh);
@@ -692,16 +719,17 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int
 // p_type が -1(おまかせ)なら重み付きでランダムに選ぶ
 static int pick_type() {
     if (p_type >= 0) return (int)(p_type + 0.5);
+    // スターマイン以外の普通の打ち上げは**菊と牡丹が主**で、ほかはたまに混ざる
     double q = rnd();
-    if (q < 0.30) return T_KIKU;
-    if (q < 0.42) return T_BOTAN;
-    if (q < 0.53) return T_YANAGI;
-    if (q < 0.64) return T_HACHI;
-    if (q < 0.74) return T_UZU;
-    if (q < 0.85) return T_SENRIN;
-    if (q < 0.90) return T_HEART;
-    if (q < 0.95) return T_RING;
-    return T_SATURN;
+    if (q < 0.42)  return T_KIKU;     // 42%
+    if (q < 0.70)  return T_BOTAN;    // 28%   (菊+牡丹 で 7割)
+    if (q < 0.78)  return T_YANAGI;   //  8%
+    if (q < 0.83)  return T_HACHI;    //  5%
+    if (q < 0.87)  return T_UZU;      //  4%
+    if (q < 0.93)  return T_SENRIN;   //  6%
+    if (q < 0.955) return T_HEART;    //  2.5%
+    if (q < 0.980) return T_RING;     //  2.5%
+    return T_SATURN;                  //  2%
 }
 // スターマインのテーマ。1テーマ = 1種類に揃えるので、菊とハートが混ざって濁らない。
 // 添字 0 は「おまかせ」= 打ち上げ開始時に 1 以降からランダムに1つ選ぶ(全種類を混ぜはしない)。
