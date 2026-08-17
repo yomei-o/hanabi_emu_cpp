@@ -145,6 +145,8 @@ struct Star {
     float sphase;          // 現在の位相 [rad]
     float spinDelay;       // ノズルに火が回るまでの時間 [s]。それまでは普通の星として飛ぶ
     float exhaust;         // 噴射速度 [m/s]。火の粉はノズルの反対向きにこの速さで出る
+    float smk;             // 煙の放出アキュムレータ
+    float smkM;            // 1粒あたりの煙の質量 [g]。0 なら煙を出さない星(間引き用)
     float delay;           // 暗飛行(点火までの時間)[s] — 飛んではいるが光らない
     float sz;              // 描画上の大きさ(その玉の標準の星に対する半径の比)
     float trail;           // 光を残光バッファへ入れる割合 (1=尾を引く星, 0=曳かない硬い星)
@@ -168,10 +170,26 @@ struct Spark {
     Col c;
     bool alive;
 };
+// 煙のかたまり。**火薬が燃えて出た煙そのもの**を粒として持つ。
+//   - 空気に引きずられる受動的なトレーサ。速度は緩和時間 TAU_REL で風に収束する
+//   - 出たては熱いので浮力で上がる。冷めるので浮力は指数で落ちる
+//   - 乱流で膨らむ (dr/dt 一定)。**質量は保存される**ので、真ん中を通る柱密度は
+//     m/(pi r^2) で薄まる = 光学的厚さ tau は半径の2乗で落ちる。
+//     1発ぶんの煙が数秒で薄くなるのも、連打すると溜まって空が霞むのも、
+//     この1本の式から出てくる(足し合わせるだけ)。
+struct Puff {
+    float x, y, z, vx, vy, vz;
+    float r;               // 半径 [m]
+    float m;               // 煙の質量 [g] — 保存量
+    float buoy;            // 浮力による加速度 [m/s^2] — 冷めて落ちる
+    float spr;             // 巻き込みによる膨張速度 dr/dt [m/s] — 後流が収まると落ちる
+    float age;
+};
 struct Shell {
     double x, y, z, vx, vy, vz;
     double k;              // 玉の弾道係数(一定)
     double shed;
+    double smk;            // 煙の放出アキュムレータ(昇り曲導の煙の筋)
     double fuse;           // 時限導火線の残り [s] — 毎ステップ dt だけ焼ける
     ShellSpec sp;
     int layers;
@@ -216,6 +234,7 @@ static std::vector<Spark> sparks;
 static std::vector<Shell> shells;
 static std::vector<Flash> flashes;
 static std::vector<Pending> pending;
+static std::vector<Puff>  puffs;
 
 // HDR 加算バッファ。2枚ある:
 //   acc  — 毎フレーム p_glow 倍に減衰させて溜める = **尾(引先)を引く**光
@@ -247,6 +266,8 @@ static double p_crackle = 0.20;   // 消え際にパラパラ(分砲)する玉�
 static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
 static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
 static double p_vivid = 1.0;     // トーンマップ: 1=色を保つ(キラキラ) 0=成分ごと(落ち着く)
+static double p_smoke = 1.0;     // 煙の量 (0 で煙の計算・描画をまるごと省く)
+static double p_shear = 1.0;     // 風の高度プロファイル (0 で高さによらない一様な風に戻す)
 
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
@@ -263,6 +284,59 @@ static int    curTheme = 1;      // この連打で実際に使うテーマ(お�
 static double qual = 1.0;
 // 実測値(毎ステップ running max で更新する = これも差分式)
 static double measH = 0.0, measD = 0.0;
+
+// ---------------------------------------------------------------- 風(高度プロファイル)
+//
+// 風は高さで変わる。地面の摩擦が効くので下ほど遅く、上ほど速い。
+// 大気境界層のべき乗則 U(y) = U10 (y/10)^alpha  (alpha=0.20 は郊外〜市街地の値)。
+// 300m では 10m の約 2.0 倍になる。
+//
+// さらに**向きも変わる**。地表付近では摩擦で等圧線を横切る向きに吹き、上へ行くほど
+// 摩擦が抜けて向きが振れる(エクマン螺旋)。高度 200m 前後でおおむね振れ切るとして、
+//   theta(y) = VEER * (1 - exp(-y/H))
+// を入れてある。これで **玉は上ほど流され、開いた花は斜めに流れながら崩れる**。
+// 風速の目盛り(スライダ)は「地上10mの風速」として読む — 気象の観測値と同じ約束。
+//
+// 突風(ガスト)は simTime のゆっくりした和で作る。**rnd() を消費しない**のがミソで、
+// 星や火の粉の乱数の並びが変わらないから、風だけを入れた前後の絵を比較できる。
+static const double WIND_ALPHA = 0.20;    // べき乗則の指数
+static const double WIND_VEER  = 0.42;    // 上空で振れる角度 [rad] (≒24度)
+static const double WIND_HVEER = 220.0;   // 振れ切る高さの目安 [m]
+static const double WIND_YMAX  = 640.0;   // プロファイル表の上端 [m]
+static const int    WIND_NTAB  = 64;
+static float windTabX[WIND_NTAB + 1], windTabZ[WIND_NTAB + 1];
+static double gustNow = 1.0;
+static bool  windFlat = false;   // true なら表を引かず一様な風で済ませる(OFF のとき)
+
+// 表を作り直す。1サブステップに1回だけ(65点なので誤差にもならない)。
+// p_shear=0 なら高さによらない一様な +x の風 = 以前とまったく同じ挙動に戻る
+static void wind_table(double t) {
+    windFlat = (p_shear < 0.5);
+    if (windFlat) { gustNow = 1.0; windTabX[0] = (float)p_wind; windTabZ[0] = 0.0f; return; }
+    // ゆっくりした3つの波の和 = 息をするような突風。平均は 1.0
+    gustNow = 1.0 + 0.26 * sin(0.21 * t) + 0.15 * sin(0.53 * t + 1.9)
+                  + 0.08 * sin(1.13 * t + 0.7);
+    for (int i = 0; i <= WIND_NTAB; ++i) {
+        double y = WIND_YMAX * i / WIND_NTAB;
+        double yy = y < 2.0 ? 2.0 : y;
+        double sp = p_wind * gustNow * pow(yy / 10.0, WIND_ALPHA);
+        double th = WIND_VEER * (1.0 - exp(-yy / WIND_HVEER));
+        windTabX[i] = (float)(sp * cos(th));
+        windTabZ[i] = (float)(sp * sin(th));
+    }
+}
+// 表を線形補間して引く。粒子は数十万個あるので pow/exp をここで呼ぶわけにはいかない
+// 火の粉は数十万粒あり、しかも1フレームに4サブステップ回る。ここは全部 float で
+// 済ませる(高度はせいぜい数百mなので float で十分)。double を混ぜると変換が入って重い
+static inline void wind_at(float y, float& wx, float& wz) {
+    if (windFlat) { wx = windTabX[0]; wz = 0.0f; return; }   // OFF のときは表を引かない
+    float u = y * (float)(WIND_NTAB / WIND_YMAX);
+    if (!(u > 0.0f)) u = 0.0f;                               // 負も NaN もここで 0 に落ちる
+    if (u > (float)WIND_NTAB - 1e-3f) u = (float)WIND_NTAB - 1e-3f;
+    int i = (int)u; float f = u - (float)i;
+    wx = windTabX[i] + (windTabX[i + 1] - windTabX[i]) * f;
+    wz = windTabZ[i] + (windTabZ[i + 1] - windTabZ[i]) * f;
+}
 
 // ---------------------------------------------------------------- 炎色
 // 実際の炎色反応。Sr=紅, Ba=緑, Cu=青, Na=黄, Mg/Al=銀, 木炭=金
@@ -412,6 +486,63 @@ static void emit_spark(double x, double y, double z, double vx, double vy, doubl
     sparks.push_back(s);
 }
 
+// ---------------------------------------------------------------- 煙
+// 煙の消光係数。新しい燃焼煙のエアロゾルは質量消光係数がおおむね 3〜8 m^2/g。
+// 真ん中を通る光学的厚さは  tau = SMOKE_K * m / (pi r^2)   (m は [g], r は [m])。
+// 5号1発ぶんの割薬の煙(約70g)を半径2.5mに詰めると tau≒2 = はっきり見える塊。
+// 半径が3倍に膨らめば tau は 1/9 になる = 数秒で薄くなる。連打で溜まるのはこの和。
+static const float  SMOKE_K     = 5.0f;    // 質量消光係数 [m^2/g]
+static const float  SMOKE_YIELD = 0.45f;   // 燃えた薬のうち煙になる割合
+// 膨らみ方は2段。星は 70m/s で飛びながら燃えているので、置いていかれた煙は
+// **激しい後流の中**にあり、最初の数秒は速く巻き込んで膨らむ。後流が収まると、
+// あとは大気のふつうの乱流拡散でゆっくり広がるだけになる。
+static const float  SMOKE_GROW  = 0.55f;   // 落ち着いてからの膨張速度 dr/dt [m/s]
+static const float  SMOKE_TAUS  = 2.40f;   // 後流の巻き込みが収まる時定数 [s]
+static const float  SMOKE_TAUV  = 0.85f;   // 風に引きずられる緩和時間 [s]
+static const float  SMOKE_TAUB  = 2.60f;   // 浮力が冷めて落ちる時定数 [s]
+static const float  SMOKE_TMIN  = 0.012f;  // これより薄くなったら消す
+static const size_t MAX_PUFFS   = 26000;
+
+static void emit_puff(double x, double y, double z, double vx, double vy, double vz,
+                      double r0, double massG, double buoy, double spr) {
+    if (puffs.size() >= MAX_PUFFS) return;
+    Puff p;
+    p.x = (float)x; p.y = (float)y; p.z = (float)z;
+    p.vx = (float)vx; p.vy = (float)vy; p.vz = (float)vz;
+    p.r = (float)r0; p.m = (float)(massG * p_smoke);
+    p.buoy = (float)buoy; p.spr = (float)spr; p.age = 0.0f;
+    puffs.push_back(p);
+}
+// 星1個ぶんの薬量 [g] (半径 r0 の球)
+static inline double star_mass_g(double r0) {
+    return RHO_STAR * (4.0 / 3.0) * M_PI * r0 * r0 * r0 * 1000.0;
+}
+// 星の煙は**間引いて**出す。1個ずつ出すと連打で粒が足りなくなるので、
+// STRIDE 個に1個だけ煙役にして、そのぶん質量を STRIDE 倍持たせる(総量は変わらない)
+static const int   SMOKE_STRIDE = 12;
+static const float SMOKE_RATE   = 1.2f;   // 煙役の星が出す粒の数 [個/s]
+static const float SMOKE_LUMP   = 0.30f;  // 玉の煙のうち開発の瞬間に出る割合
+
+// 開発の瞬間に出る煙 — 割薬と玉皮、それに一斉に火が回った星のぶん。
+// 熱いので浮力を持ち、割薬の勢いで外へ広がる。
+// **rnd() を使わない**ので、煙を切っても花火そのものは1粒も変わらない
+static void burst_smoke(const Shell& sh, double massG) {
+    if (p_smoke <= 0.001 || massG <= 0.0) return;
+    const int n = 8;
+    double per = massG / n;
+    double sp = 5.0 + 1.1 * sh.sp.go;     // 割薬に押されて広がる速さ [m/s]
+    for (int i = 0; i < n; ++i) {
+        double yy = 1.0 - 2.0 * (i + 0.5) / n;
+        double rr = sqrt(std::max(0.0, 1.0 - yy * yy));
+        double ph = i * 2.39996322973;
+        emit_puff(sh.x, sh.y, sh.z,
+                  sh.vx * 0.20 + rr * cos(ph) * sp,
+                  sh.vy * 0.20 + yy * sp,
+                  sh.vz * 0.20 + rr * sin(ph) * sp,
+                  1.1 + 0.20 * sh.sp.go, per, 5.0, 4.5);
+    }
+}
+
 // 型物の輪郭。u∈[0,1) を受けて、観客を向いた平面上の点(半径1に正規化)を返す
 static void shape_point(int type, double u, double& sx, double& sy) {
     double t = u * 6.2831853;
@@ -451,6 +582,8 @@ static void burst(Shell sh) {
                         s.starV * 0.85 * (1.0 + rnds() * 0.06), cgo,
                         1.45 + rnd() * 0.55, rnd() < 0.5 ? T_BOTAN : T_KIKU);
         }
+        // 千輪の親玉は星を持たないので、開発の煙は割薬ぶんだけ
+        burst_smoke(sh, 9.0 * s.go);
         if (flashes.size() < 64) {
             Flash f; f.x = sh.x; f.y = sh.y; f.z = sh.z;
             f.t0 = f.t = 0.10; f.pw = 3.2 * s.go; f.alive = true;
@@ -614,6 +747,12 @@ static void burst(Shell sh) {
                 st.c0 = c0; st.c1 = c1; st.chg = chg; st.tail = tail;
             }
             st.shedRate = (float)(115.0 * p_shed * tshed);
+            // 星が燃えながら曳く煙。STRIDE 個に1個だけ煙役にして、そのぶん重く持たせる。
+            // 種は使わない(番号から決める)ので、煙を切っても乱数の並びがずれない
+            st.smk = (float)(i * 0.6180339887 - floor(i * 0.6180339887));
+            st.smkM = (i % SMOKE_STRIDE) ? 0.0f
+                    : (float)(star_mass_g(st.r0) * SMOKE_YIELD * (1.0 - SMOKE_LUMP)
+                              / burnT * SMOKE_STRIDE / SMOKE_RATE);
             st.delay = (L == 0) ? 0.0f : (float)(0.10 + 0.16 * L);   // 芯は少し遅れて点火(時差開発)
             st.sz = (float)szK;
             st.trail = (float)ttrail;
@@ -663,6 +802,9 @@ static void burst(Shell sh) {
             stars.push_back(st);
         }
     }
+    // 開発の煙。玉ぜんたいの薬量から出る煙のうち SMOKE_LUMP を割薬・玉皮ぶんとして
+    // ここで一度に出す。残りは星が燃えながら曳いていく(下の Star::smkM)
+    burst_smoke(sh, star_mass_g(s.starR) * s.nstar * layers * SMOKE_YIELD * SMOKE_LUMP);
     if (flashes.size() < 64) {
         Flash f; f.x = sh.x; f.y = sh.y; f.z = sh.z;
         f.t0 = f.t = 0.10; f.pw = 3.2 * s.go; f.alive = true;
@@ -682,6 +824,7 @@ static void spawn_child(const Shell& p, double dx, double dy, double dz, double 
     c.vx = p.vx + dx * v; c.vy = p.vy + dy * v; c.vz = p.vz + dz * v;
     c.k = 0.5 * RHO_AIR * CD * (M_PI * s.dia * s.dia * 0.25) / s.mass;
     c.shed = 0;
+    c.smk = 0;
     c.fuse = fuse;
     c.sp = s;
     c.type = type;
@@ -709,6 +852,7 @@ static void launch_ex(double nx, double go, int type, double fuseJit = 0.03, int
     // 打揚薬が与える初速。ここから先は積分するだけ — 到達高度は結果として出る
     sh.vx = rnds() * 1.2; sh.vy = s.liftV * (1.0 + rnds() * 0.02); sh.vz = rnds() * 1.2;
     sh.shed = 0;
+    sh.smk = 0;
     // 時限導火線に点火。秒時のばらつき=開発高度のばらつき。
     // fuseScale を縮めると頂点まで待たずに低い位置で開く(フェニックスの低い小玉)
     sh.fuse = s.fuseT * fuseScale * (1.0 + rnds() * fuseJit);
@@ -833,6 +977,176 @@ static void start_barrage() {
     if (curTheme >= THEME_COUNT) curTheme = THEME_COUNT - 1;
 }
 
+// ---------------------------------------------------------------- 煙の描画
+//
+// 煙は滑らかなので **1/6 の低解像度**で足りる。ただし1枚だと「手前の煙か奥の煙か」が
+// 分からず、奥の花火だけを霞ませることができない。そこで**奥行きでスラブに分ける**:
+//
+//   smkTau[k] — スラブ k(手前から数えて k 番目)の光学的厚さ
+//   smkT[k]   — スラブ k **より手前**にある煙の透過率 exp(-Σtau)。k=NSLAB は全部ぶん
+//
+// 光る粒を撒くときに、その粒が属するスラブの透過率を掛ける。これだけで
+// 「手前の煙の向こうにある花火は暗く霞み、手前の花火はそのまま明るい」が出る。
+// 夜空(背景)は無限遠なので全部ぶんの透過率を掛ける = 煙が空を隠す。
+//
+// 煙自身の明るさは**単散乱の近似**: 低解像度に落とした光をぼかして、
+// 煙の不透明度 (1 - T) を掛ける。花火が上がると煙がぼうっと光り、
+// 何もない時間は街明かりぶん(SMOKE_AMB)だけ灰色に見える。
+static const int SMK   = 6;
+static const int SW    = FW / SMK;      // 160
+static const int SH    = FH / SMK;      // 100
+static const int NSLAB = 6;
+// 散乱の強さ。物理的なアルベドは 0.5 前後だが、ここに入れる「照らしている光」は
+// 広い箱でならしたものなので、そのぶん薄まっている。ならす前のピークに対する
+// 見かけの倍率としてまとめて持たせる(絵を見て決めた)
+static const float SMOKE_ALB   = 1.60f;
+static const Col   SMOKE_AMB   = { 0.045f, 0.041f, 0.038f };  // 街明かりで見える地の明るさ
+static std::vector<float> smkTau, smkT, smkOut, smkLit;
+static double zSlab0 = 0, zSlabInv = 0;
+static bool   smokeOn = false;
+static int    colI[FW]; static float colF[FW]; static bool colReady = false;
+
+// 奥行き(カメラ座標の z)からスラブ番号。project() が返す sc = camF/zp を使い回す
+static inline int slab_of(double sc) {
+    int k = (int)((camF / sc - zSlab0) * zSlabInv);
+    return k < 0 ? 0 : (k >= NSLAB ? NSLAB - 1 : k);
+}
+// スラブ k より手前の透過率を画面座標で引く(バイリニア)
+static inline float smoke_T(int k, double sx, double sy) {
+    const float* T = &smkT[(size_t)k * SW * SH];
+    double u = sx * (1.0 / SMK) - 0.5, v = sy * (1.0 / SMK) - 0.5;
+    int iu = (int)u, iv = (int)v;
+    if (iu < 0) iu = 0; else if (iu > SW - 2) iu = SW - 2;
+    if (iv < 0) iv = 0; else if (iv > SH - 2) iv = SH - 2;
+    float fu = (float)(u - iu), fv = (float)(v - iv);
+    if (fu < 0) fu = 0; else if (fu > 1) fu = 1;
+    if (fv < 0) fv = 0; else if (fv > 1) fv = 1;
+    const float* p = &T[(size_t)iv * SW + iu];
+    float a = p[0] + (p[1] - p[0]) * fu;
+    float b = p[SW] + (p[SW + 1] - p[SW]) * fu;
+    return a + (b - a) * fv;
+}
+
+// 煙をスラブに撒いて、手前から積んだ透過率を作る
+static void smoke_build() {
+    smkTau.assign((size_t)NSLAB * SW * SH, 0.0f);
+    smkT.assign((size_t)(NSLAB + 1) * SW * SH, 1.0f);
+    zSlab0 = camD * 0.70; zSlabInv = NSLAB / (camD * 0.60);
+    for (size_t i = 0; i < puffs.size(); ++i) {
+        const Puff& p = puffs[i];
+        double sx, sy, sc;
+        if (!project(p.x, p.y, p.z, sx, sy, sc)) continue;
+        float tau0 = SMOKE_K * p.m / (3.14159265f * p.r * p.r);
+        double cx = sx * (1.0 / SMK) - 0.5, cy = sy * (1.0 / SMK) - 0.5;
+        float R = (float)(p.r * sc) * (1.0f / SMK);      // 低解像度での半径 [px]
+        if (R > 20.0f) R = 20.0f;
+        if (cx < -R - 1 || cy < -R - 1 || cx > SW + R || cy > SH + R) continue;
+        float* dst = &smkTau[(size_t)slab_of(sc) * SW * SH];
+        // 画素より小さい粒は、積分値(tau の面積分 = tau0 * pi R^2 / 3)を1画素に置く。
+        // 大きい粒は中心が tau0 になるようにコンパクトな釣鐘 (1 - d^2/R^2)^2 で撒く
+        // (指数関数は1粒あたり数百回呼ぶことになるので使わない)
+        if (R < 1.0f) {
+            int ix = (int)(cx + 0.5), iy = (int)(cy + 0.5);
+            if (ix >= 0 && iy >= 0 && ix < SW && iy < SH)
+                dst[(size_t)iy * SW + ix] += tau0 * 1.0471976f * R * R;
+            continue;
+        }
+        int ir = (int)R;
+        int x0 = (int)cx - ir, x1 = (int)cx + ir + 1;
+        int y0 = (int)cy - ir, y1 = (int)cy + ir + 1;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > SW - 1) x1 = SW - 1; if (y1 > SH - 1) y1 = SH - 1;
+        float inv = 1.0f / (R * R);
+        for (int y = y0; y <= y1; ++y) {
+            float dy = (float)(y - cy);
+            float* row = dst + (size_t)y * SW;
+            for (int x = x0; x <= x1; ++x) {
+                float dx = (float)(x - cx);
+                float t = 1.0f - (dx * dx + dy * dy) * inv;
+                if (t <= 0.0f) continue;
+                row[x] += tau0 * t * t;
+            }
+        }
+    }
+    // 手前から積む。何もない画素がほとんどなので、そこは exp を呼ばずに素通し
+    const int NP = SW * SH;
+    for (int k = 0; k < NSLAB; ++k) {
+        const float* prev = &smkT[(size_t)k * NP];
+        const float* tau  = &smkTau[(size_t)k * NP];
+        float* next = &smkT[(size_t)(k + 1) * NP];
+        for (int p = 0; p < NP; ++p)
+            next[p] = (tau[p] <= 0.0f) ? prev[p] : prev[p] * expf(-tau[p]);
+    }
+}
+
+// 煙自身の明るさ(単散乱の近似)を作る。smkOut に {全透過率, 光 r,g,b} を詰める
+static void smoke_shade() {
+    const int NP = SW * SH;
+    smkLit.assign((size_t)NP * 3, 0.0f);
+    // 光を 1/SMK に落とす。滑らかにする前段なので、全画素は見ずに1つ飛ばしで拾う
+    const float inv = 1.0f / 9.0f;
+    for (int j = 0; j < FH; j += 2) {
+        float* row = &smkLit[(size_t)(j / SMK) * SW * 3];
+        const float* a = &acc[(size_t)j * FW * 3];
+        const float* b = &accN[(size_t)j * FW * 3];
+        for (int i = 0; i < FW; i += 2) {
+            float* d = row + (size_t)(i / SMK) * 3;
+            d[0] += (a[i * 3] + b[i * 3]) * inv;
+            d[1] += (a[i * 3 + 1] + b[i * 3 + 1]) * inv;
+            d[2] += (a[i * 3 + 2] + b[i * 3 + 2]) * inv;
+        }
+    }
+    // 大きくぼかす。煙を照らしているのは**画面のあちこちで開いている花火ぜんぶ**で、
+    // 光源は目のくらむ明るさなので、遠くの煙まで届く。ぼかしが足りないと
+    // 「光っている所の煙しか光らない」= 花火の輪郭がそのまま煙に写るだけになる。
+    // 半径 RB の箱ぼかしを縦横2回ずつ。移動和なので半径によらず1画素あたり定数時間
+    static std::vector<float> tmp;
+    tmp.assign((size_t)NP * 3, 0.0f);
+    const int RB = 7;
+    const float nb = 1.0f / (2 * RB + 1);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int j = 0; j < SH; ++j) {                       // 横
+            const float* s = &smkLit[(size_t)j * SW * 3];
+            float* d = &tmp[(size_t)j * SW * 3];
+            float sum[3] = { 0, 0, 0 };
+            for (int i = -RB; i <= RB; ++i) {
+                int q = i < 0 ? 0 : (i >= SW ? SW - 1 : i);
+                for (int c = 0; c < 3; ++c) sum[c] += s[q * 3 + c];
+            }
+            for (int i = 0; i < SW; ++i) {
+                for (int c = 0; c < 3; ++c) d[i * 3 + c] = sum[c] * nb;
+                int lo = i - RB, hi = i + RB + 1;
+                lo = lo < 0 ? 0 : lo; hi = hi >= SW ? SW - 1 : hi;
+                for (int c = 0; c < 3; ++c) sum[c] += s[hi * 3 + c] - s[lo * 3 + c];
+            }
+        }
+        for (int i = 0; i < SW; ++i) {                       // 縦
+            float sum[3] = { 0, 0, 0 };
+            for (int j = -RB; j <= RB; ++j) {
+                int q = j < 0 ? 0 : (j >= SH ? SH - 1 : j);
+                for (int c = 0; c < 3; ++c) sum[c] += tmp[(size_t)q * SW * 3 + i * 3 + c];
+            }
+            for (int j = 0; j < SH; ++j) {
+                for (int c = 0; c < 3; ++c) smkLit[(size_t)j * SW * 3 + i * 3 + c] = sum[c] * nb;
+                int lo = j - RB, hi = j + RB + 1;
+                lo = lo < 0 ? 0 : lo; hi = hi >= SH ? SH - 1 : hi;
+                for (int c = 0; c < 3; ++c)
+                    sum[c] += tmp[(size_t)hi * SW * 3 + i * 3 + c] - tmp[(size_t)lo * SW * 3 + i * 3 + c];
+            }
+        }
+    }
+    smkOut.assign((size_t)NP * 4, 0.0f);
+    const float* Ttot = &smkT[(size_t)NSLAB * NP];
+    for (int p = 0; p < NP; ++p) {
+        float T = Ttot[p];
+        float op = 1.0f - T;                    // 遮った割合 = 散乱に回せる割合
+        smkOut[p * 4 + 0] = T;
+        smkOut[p * 4 + 1] = (SMOKE_ALB * smkLit[p * 3]     + SMOKE_AMB.r) * op;
+        smkOut[p * 4 + 2] = (SMOKE_ALB * smkLit[p * 3 + 1] + SMOKE_AMB.g) * op;
+        smkOut[p * 4 + 3] = (SMOKE_ALB * smkLit[p * 3 + 2] + SMOKE_AMB.b) * op;
+    }
+}
+
 // ---------------------------------------------------------------- ABI
 extern "C" {
 
@@ -841,7 +1155,8 @@ KEEP int sim_h() { return FH; }
 
 KEEP void sim_reset() {
     stars.clear(); sparks.clear(); shells.clear(); flashes.clear(); pending.clear();
-    stars.reserve(20000); sparks.reserve(60000);
+    puffs.clear();
+    stars.reserve(20000); sparks.reserve(60000); puffs.reserve(8000);
     acc.assign((size_t)FW * FH * 3, 0.0f);
     accN.assign((size_t)FW * FH * 3, 0.0f);
     simTime = 0; launchTimer = 0.4; frameNo = 0;
@@ -901,6 +1216,8 @@ KEEP void sim_set(int id, double v) {
     case 13: p_hud = v; break;
     case 14: p_crackle = v < 0 ? 0 : (v > 1 ? 1 : v); break;   // パラパラの割合
     case 15: p_vivid = v; break;                               // トーンマップ(1=キラキラ)
+    case 16: p_smoke = v < 0 ? 0 : v; if (p_smoke <= 0.001) puffs.clear(); break;  // 煙の量
+    case 17: p_shear = v; break;                               // 風の高度プロファイル
     }
 }
 
@@ -924,6 +1241,9 @@ KEEP double sim_get(int id) {
     case 14: return starTimer;           // 次の自動スターマインまで [s]
     case 15: return p_starInt;
     case 16: return p_vivid;
+    case 17: return (double)puffs.size();   // 煙の粒の数
+    case 18: return p_smoke;
+    case 19: return p_shear;
     }
     return 0.0;
 }
@@ -946,6 +1266,7 @@ KEEP void sim_step(int frames) {
         for (int ss = 0; ss < SUBSTEPS; ++ss) {
             const double dt = DT;
             simTime += dt;
+            wind_table(simTime);   // 高度プロファイル＋突風。65点の表を作り直すだけ
 
             // --- 粒子予算の負荷から引先の量を追従調整(一次遅れ)
             {
@@ -1026,7 +1347,8 @@ KEEP void sim_step(int frames) {
             for (size_t i = 0; i < shells.size(); ++i) {
                 Shell& sh = shells[i];
                 if (!sh.alive) continue;
-                double vrx = sh.vx - p_wind, vry = sh.vy, vrz = sh.vz;
+                float wx, wz; wind_at((float)sh.y, wx, wz);    // 上ほど強く、向きも振れる
+                double vrx = sh.vx - wx, vry = sh.vy, vrz = sh.vz - wz;
                 double sp = sqrt(vrx * vrx + vry * vry + vrz * vrz);
                 sh.vx += (-sh.k * sp * vrx) * dt;
                 sh.vy += (-sh.k * sp * vry - G_ACC) * dt;
@@ -1039,6 +1361,15 @@ KEEP void sim_step(int frames) {
                     emit_spark(sh.x, sh.y, sh.z,
                                sh.vx * 0.05 + rnds() * 1.5, sh.vy * 0.05 + rnds() * 1.5, sh.vz * 0.05 + rnds() * 1.5,
                                mixc(C_GOLD, C_SILVER, (float)rnd() * 0.5f), 0.00035);
+                }
+                // 昇り曲導の煙。これが**空に残る縦の煙の筋**になる
+                if (p_smoke > 0.001) {
+                    sh.smk += 8.3 * (sh.gen ? 0.25 : 1.0) * dt;
+                    while (sh.smk >= 1.0) {
+                        sh.smk -= 1.0;
+                        emit_puff(sh.x, sh.y, sh.z, sh.vx * 0.06, sh.vy * 0.06, sh.vz * 0.06,
+                                  0.9, 0.17 * sh.sp.go * 0.2, 1.6, 1.4);
+                    }
                 }
                 if (sh.y > measH) measH = sh.y;   // 到達高度は積分の結果
                 sh.fuse -= dt;                    // 時限導火線が焼ける
@@ -1057,7 +1388,8 @@ KEEP void sim_step(int frames) {
             for (size_t i = 0; i < stars.size(); ++i) {
                 Star& st = stars[i];
                 double k = star_k(st.r);
-                double vrx = st.vx - p_wind, vry = st.vy, vrz = st.vz;
+                float wx, wz; wind_at((float)st.y, wx, wz);
+                double vrx = st.vx - wx, vry = st.vy, vrz = st.vz - wz;
                 double sp = sqrt(vrx * vrx + vry * vry + vrz * vrz);
                 double ax = -k * sp * vrx, ay = -k * sp * vry - G_ACC, az = -k * sp * vrz;
                 double sph0 = st.sphase;      // このサブステップの開始位相(火の粉の補間に使う)
@@ -1091,6 +1423,15 @@ KEEP void sim_step(int frames) {
                 double ddx = st.x - st.bx, ddz = st.z - st.bz;
                 double d2 = ddx * ddx + ddz * ddz;
                 if (d2 > measD * measD) measD = sqrt(d2);
+                // 星が燃えながら曳く煙。花の形をした煙が残り、そのあと風で流れていく
+                if (st.smkM > 0.0f) {
+                    st.smk += SMOKE_RATE * (float)dt;
+                    if (st.smk >= 1.0f) {
+                        st.smk -= 1.0f;
+                        emit_puff(st.x, st.y, st.z, st.vx * 0.15, st.vy * 0.15, st.vz * 0.15,
+                                  1.6, st.smkM, 1.2, 3.2);
+                    }
+                }
                 // 引先(尾) — 燃えかすを実際に放出する
                 double prog = 1.0 - st.r / st.r0;
                 Col hc = (prog < st.chg) ? st.c0 : st.c1;
@@ -1132,7 +1473,8 @@ KEEP void sim_step(int frames) {
             // --- 火の粉
             for (size_t i = 0; i < sparks.size(); ++i) {
                 Spark& s = sparks[i];
-                float vrx = s.vx - (float)p_wind, vry = s.vy, vrz = s.vz;
+                float wx, wz; wind_at(s.y, wx, wz);
+                float vrx = s.vx - wx, vry = s.vy, vrz = s.vz - wz;
                 float sp = sqrtf(vrx * vrx + vry * vry + vrz * vrz);
                 float kk = s.k * sp * (float)dt;
                 s.vx -= kk * vrx; s.vy -= kk * vry + (float)(G_ACC * dt); s.vz -= kk * vrz;
@@ -1152,6 +1494,34 @@ KEEP void sim_step(int frames) {
                 else ++i;
             }
         }
+
+        // --- 煙。数秒〜数十秒かけて動くゆっくりしたものなので、
+        //     サブステップは要らない(1フレームに1回で十分)
+        if (!puffs.empty()) {
+            const float pdt = (float)(DT * SUBSTEPS);
+            const float a = pdt / SMOKE_TAUV;
+            for (size_t i = 0; i < puffs.size(); ++i) {
+                Puff& p = puffs[i];
+                // 空気に引きずられる受動的なトレーサ。速度は緩和時間 TAU_REL で風に収束する
+                float wx, wz; wind_at(p.y, wx, wz);
+                p.vx += (wx - p.vx) * a;
+                p.vz += (wz - p.vz) * a;
+                p.vy += (0.0f - p.vy) * a + p.buoy * pdt;   // 上下の風は無し。浮力だけ足す
+                p.buoy -= p.buoy * (pdt / SMOKE_TAUB);      // 冷めて浮力が抜ける
+                p.x += p.vx * pdt; p.y += p.vy * pdt; p.z += p.vz * pdt;
+                // 巻き込みで膨らむ = 薄まる。後流の激しい最初の数秒だけ速い
+                p.r += (SMOKE_GROW + p.spr) * pdt;
+                p.spr -= p.spr * (pdt / SMOKE_TAUS);
+                p.age += pdt;
+            }
+            for (size_t i = 0; i < puffs.size();) {
+                const Puff& p = puffs[i];
+                float tau = SMOKE_K * p.m / (3.14159265f * p.r * p.r);
+                if (tau < SMOKE_TMIN || p.y < -20.0f || p.age > 70.0f) {
+                    puffs[i] = puffs.back(); puffs.pop_back();
+                } else ++i;
+            }
+        }
         frameNo++;
     }
 }
@@ -1162,6 +1532,10 @@ KEEP uint8_t* sim_render() {
     size_t n3 = acc.size();
     for (size_t i = 0; i < n3; ++i) acc[i] *= dec;
     std::fill(accN.begin(), accN.end(), 0.0f);      // 尾を引かない光は毎フレーム消す
+
+    // 煙。切ってあるときは以下の計算も合成もまるごと飛ばす
+    smokeOn = (p_smoke > 0.001 && !puffs.empty());
+    if (smokeOn) smoke_build();
 
     // 火の粉 — 燃え尽きるにつれて暗く、赤く冷える
     for (size_t i = 0; i < sparks.size(); ++i) {
@@ -1178,6 +1552,7 @@ KEEP uint8_t* sim_render() {
         Col c = (lf > 0.60f) ? mixc(C_GOLD, s.c, (lf - 0.60f) * 2.5f)
                              : mixc(C_EMBER, C_GOLD, lf * (1.0f / 0.60f));
         float amp = 0.34f * lf * lf * (float)(sc / camF * 520.0);
+        if (smokeOn) amp *= smoke_T(slab_of(sc), sx, sy);   // 手前の煙で減る
         splat_point(acc.data(), sx, sy, c, amp);
     }
 
@@ -1200,6 +1575,7 @@ KEEP uint8_t* sim_render() {
         Col c = (prog < st.chg) ? st.c0 : st.c1;
         float f = (float)((st.r / st.r0) * (st.r / st.r0));
         float amp = (0.9f + 2.6f * f) * (float)(sc / camF * 520.0);
+        if (smokeOn) amp *= smoke_T(slab_of(sc), sx, sy);
         // 星が大きいほど点も大きく写る。amp(ピークの明るさ)はそのままなので、
         // 総光量は半径の2乗で増える = 燃焼表面積に比例する(型物の大きい星が明るいのはこれ)
         float rad = (1.0f + 1.4f * f) * st.sz;
@@ -1220,8 +1596,13 @@ KEEP uint8_t* sim_render() {
         double sx, sy, sc;
         if (!project(fl.x, fl.y, fl.z, sx, sy, sc)) continue;
         float t = (float)(fl.t / fl.t0);
-        splat_disc(acc.data(), sx, sy, (float)(fl.pw * t), { 1.0f, 0.92f, 0.72f }, 2.2f * t * t);
+        float amp = 2.2f * t * t;
+        if (smokeOn) amp *= smoke_T(slab_of(sc), sx, sy);
+        splat_disc(acc.data(), sx, sy, (float)(fl.pw * t), { 1.0f, 0.92f, 0.72f }, amp);
     }
+
+    // 煙自身の見え方(散乱)。光を撒き終わってから作る
+    if (smokeOn) smoke_shade();
 
     // トーンマップして夜空に合成。**実行時に2つの式を切り替えられる**(`sim_set(15, ..)`)。
     //
@@ -1235,27 +1616,64 @@ KEEP uint8_t* sim_render() {
     // 2026-08-17 に「キラキラのほうを入れてみて」と再要望があり既定に戻した。
     // ビルドし直さずボタンで見比べられるので、どちらでも選べる形にしてある。
     const bool vivid = (p_vivid > 0.5);
-    for (size_t i = 0, np = (size_t)FW * FH; i < np; ++i) {
-        float r = acc[i * 3] + accN[i * 3], g = acc[i * 3 + 1] + accN[i * 3 + 1],
-              b = acc[i * 3 + 2] + accN[i * 3 + 2];
-        if (r + g + b < 0.004f) { px[i] = bg[i]; continue; }
-        int R, G, B;
-        if (vivid) {
-            float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-            float t = mx / (1.0f + mx);           // 圧縮した明るさ
-            float s = t / mx;                     // 色の向きを保ったまま合わせる倍率
-            float wht = smoothstep(4.0f, 16.0f, mx);   // ここから上は飛んで白くなる
-            R = (int)(255.0f * (r * s + (t - r * s) * wht));
-            G = (int)(255.0f * (g * s + (t - g * s) * wht));
-            B = (int)(255.0f * (b * s + (t - b * s) * wht));
-        } else {
-            R = (int)(255.0f * (r / (1.0f + r)));
-            G = (int)(255.0f * (g / (1.0f + g)));
-            B = (int)(255.0f * (b / (1.0f + b)));
+    // 煙の低解像度バッファを画面解像度に伸ばす。1画素ごとに縦横のバイリニアを回すと
+    // 60万画素ぶんの掛け算が4倍になるので、**縦は行の頭で1回だけ混ぜて**しまい、
+    // 画素ループでは横の補間だけにする(列の係数は解像度が固定なので1度作れば使い回せる)
+    if (!colReady) {
+        for (int i = 0; i < FW; ++i) {
+            double u = (i + 0.5) / SMK - 0.5;
+            int iu = (int)u; if (iu < 0) iu = 0; else if (iu > SW - 2) iu = SW - 2;
+            float f = (float)(u - iu); if (f < 0) f = 0; else if (f > 1) f = 1;
+            colI[i] = iu; colF[i] = f;
         }
-        uint32_t d = bg[i];
-        R += (int)(d & 255); G += (int)((d >> 8) & 255); B += (int)((d >> 16) & 255);
-        px[i] = rgb(R > 255 ? 255 : R, G > 255 ? 255 : G, B > 255 ? 255 : B);
+        colReady = true;
+    }
+    static std::vector<float> rowb;
+    if (rowb.size() != (size_t)SW * 4) rowb.assign((size_t)SW * 4, 0.0f);
+
+    for (int j = 0; j < FH; ++j) {
+        if (smokeOn) {
+            double v = (j + 0.5) / SMK - 0.5;
+            int iv = (int)v; if (iv < 0) iv = 0; else if (iv > SH - 2) iv = SH - 2;
+            float fv = (float)(v - iv); if (fv < 0) fv = 0; else if (fv > 1) fv = 1;
+            const float* s0 = &smkOut[(size_t)iv * SW * 4];
+            const float* s1 = s0 + SW * 4;
+            for (int q = 0; q < SW * 4; ++q) rowb[q] = s0[q] + (s1[q] - s0[q]) * fv;
+        }
+        for (int i2 = 0; i2 < FW; ++i2) {
+            size_t i = (size_t)j * FW + i2;
+            float r = acc[i * 3] + accN[i * 3], g = acc[i * 3 + 1] + accN[i * 3 + 1],
+                  b = acc[i * 3 + 2] + accN[i * 3 + 2];
+            float T = 1.0f;
+            if (smokeOn) {
+                const float* a = &rowb[(size_t)colI[i2] * 4]; float f = colF[i2];
+                T  = a[0] + (a[4] - a[0]) * f;
+                r += a[1] + (a[5] - a[1]) * f;      // 煙が散乱して返す光
+                g += a[2] + (a[6] - a[2]) * f;
+                b += a[3] + (a[7] - a[3]) * f;
+            }
+            if (r + g + b < 0.004f && T > 0.998f) { px[i] = bg[i]; continue; }
+            int R, G, B;
+            if (vivid) {
+                float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                float t = mx / (1.0f + mx);           // 圧縮した明るさ
+                float s = mx > 1e-6f ? t / mx : 0.0f; // 色の向きを保ったまま合わせる倍率
+                float wht = smoothstep(4.0f, 16.0f, mx);   // ここから上は飛んで白くなる
+                R = (int)(255.0f * (r * s + (t - r * s) * wht));
+                G = (int)(255.0f * (g * s + (t - g * s) * wht));
+                B = (int)(255.0f * (b * s + (t - b * s) * wht));
+            } else {
+                R = (int)(255.0f * (r / (1.0f + r)));
+                G = (int)(255.0f * (g / (1.0f + g)));
+                B = (int)(255.0f * (b / (1.0f + b)));
+            }
+            // 夜空は無限遠なので、煙は全部が手前にある = 全透過率を掛けて隠す
+            uint32_t d = bg[i];
+            R += (int)((d & 255) * T);
+            G += (int)(((d >> 8) & 255) * T);
+            B += (int)(((d >> 16) & 255) * T);
+            px[i] = rgb(R > 255 ? 255 : R, G > 255 ? 255 : G, B > 255 ? 255 : B);
+        }
     }
 
     if (p_hud < 0.5) return (uint8_t*)px.data();     // 文字なし(フルスクリーン鑑賞モード)
@@ -1297,16 +1715,24 @@ int main(int argc, char** argv) {
     if (argc > 6) sim_set(12, atof(argv[6]));     // 7番目の引数 = 自動スターマインの間隔
     if (argc > 7) sim_set(13, atof(argv[7]));     // 8番目の引数 = 0 で HUD の文字を消す
     if (argc > 8) sim_set(0,  atof(argv[8]));     // 9番目の引数 = 号数
+    if (argc > 10) sim_set(3, atof(argv[10]));    // 11番目の引数 = 地上10mの風速 [m/s]
+    if (argc > 11) sim_set(16, atof(argv[11]));   // 12番目の引数 = 煙の量 (0 で無し)
+    if (argc > 12) sim_set(17, atof(argv[12]));   // 13番目の引数 = 風の高度プロファイル(0でOFF)
     if (argc > 9) sim_set(15, atof(argv[9]));     // 10番目の引数 = トーンマップ(1=キラキラ 0=従来)
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
         if ((barrage || argc > 6) && i % 30 == 0)
+        {
+            double tmx = 0, tsum = 0; int nz = 0;
+            for (size_t q = 0; q < smkTau.size(); ++q)
+                if (smkTau[q] > 0) { nz++; tsum += smkTau[q]; if (smkTau[q] > tmx) tmx = smkTau[q]; }
             printf("  t=%5.1fs phase=%d theme=%d bar=%3d/%-3d quiet=%4.1f next=%5.1f "
-                   "shells=%2d stars=%5d sparks=%6d q=%.2f\n",
+                   "shells=%2d stars=%5d sparks=%6d puffs=%5d tauMax=%.2f cover=%.1f%% q=%.2f\n",
                    sim_get(9), (int)sim_get(10), (int)sim_get(13), barTotal - barLeft, barTotal,
                    sim_get(11), sim_get(14), (int)sim_get(4), (int)sim_get(2), (int)sim_get(3),
-                   sim_get(8));
+                   (int)sim_get(17), tmx, 100.0 * nz / (SW * SH * NSLAB), sim_get(8));
+        }
     }
     uint8_t* p = sim_render();
     int nb = 0; for (int k = 0; k < FW * FH; ++k) if (px[k] != bg[k]) nb++;

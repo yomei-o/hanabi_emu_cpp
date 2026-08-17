@@ -68,7 +68,8 @@ const CONFIG = {
     { id:1, label:"星の数",          min:0.4,  max:1.8, step:0.05, val:1.0,  dec:2 },
     { id:5, label:"芯の数",          min:0,    max:2,   step:1,    val:1,    dec:0 },
     { id:2, label:"打上間隔 [s]",    min:0.6,  max:6.0, step:0.1,  val:2.2,  dec:1 },
-    { id:3, label:"風速 [m/s]",      min:-8,   max:8,   step:0.5,  val:1.5,  dec:1 },
+    { id:3, label:"風速 [m/s] (地上10m)", min:-8, max:8, step:0.5,  val:1.5,  dec:1 },
+    { id:16,label:"煙の量 (0でOFF)",  min:0,    max:2,   step:0.05, val:1.0,  dec:2 },
     { id:4, label:"火の粉(引先)",    min:0,    max:2,   step:0.05, val:1.0,  dec:2 },
     { id:6, label:"残光",            min:0.60, max:0.94,step:0.01, val:0.82, dec:2 },
     { id:14,label:"パラパラ(分砲)の割合", min:0, max:1, step:0.05, val:0.20, dec:2 },
@@ -85,7 +86,7 @@ const CONFIG = {
 const $=id=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
 let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
-let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, btnVivid=null, selTheme=null;
+let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, btnVivid=null, btnShear=null, selTheme=null;
 // C++ 側 THEMES[] と同じ並び
 const THEMES=["🎲 おまかせ（毎回どれか1つ）","菊 — 色とりどり","🌸 桜 — ピンクの菊だけ",
               "銀世界 — 銀の菊だけ","牡丹","金の柳","蜂","渦蜂","千輪","型物","🏅 錦冠（金冠）","🔥 フェニックス — 大玉横一列＋低い小玉"];
@@ -166,6 +167,11 @@ function buildPanel(){
   btnAuto=mk("⏱ 自動連発");
   onPress(btnAuto,()=>{ api.action(2); syncButtons(); });
 
+  // 風の高度プロファイル(ウィンドシア)の ON/OFF。負荷が気になるときは切れる
+  btnShear=mk("🌬 風: 高度プロファイル");
+  btnShear.title="ON=上空ほど強く向きも振れる(べき乗則＋エクマン螺旋)＋突風 / OFF=高さによらない一様な風";
+  onPress(btnShear,()=>{ api.set(17, api.get(19)>0.5?0:1); syncButtons(); });
+
   // 光り方(トーンマップ)の切替。ビルドし直さずその場で見比べられる
   btnVivid=mk("✨ 光り方: キラキラ");
   btnVivid.title="キラキラ=明るさだけ圧縮して色の向きを保つ / 落ち着いた=成分ごとに圧縮して芯が白く飛ぶ";
@@ -218,6 +224,9 @@ function syncButtons(){
   const viv=api.get(16)>0.5;
   setText(btnVivid, viv ? "✨ 光り方: キラキラ" : "🕯 光り方: 落ち着いた");
   btnVivid.classList.toggle("on", viv);
+  const sh=api.get(19)>0.5;
+  setText(btnShear, sh ? "🌬 風: 高度プロファイル" : "🌬 風: 一様");
+  btnShear.classList.toggle("on", sh);
 }
 
 function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }
@@ -237,7 +246,8 @@ function loop(ts){
     (ph===1 ? `🎆 ${(THEMES[(api.get(13)|0)]||"").replace(/ —.*$/,"")} ${(api.get(1)-api.get(0))|0}/${api.get(1)|0}   `
    : ph===2 ? `🌙 余韻   ` : ``) +
     `${fpsAvg.toFixed(0)} fps (x${n})   玉 ${api.get(4)|0} 発上昇中   星 ${api.get(2)|0} 個   ` +
-    `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   引先 ${(api.get(8)*100).toFixed(0)}%   ` +
+    `火の粉 ${(api.get(3)|0).toLocaleString()} 粒   煙 ${(api.get(17)|0).toLocaleString()} 塊   ` +
+    `引先 ${(api.get(8)*100).toFixed(0)}%   ` +
     `実測 到達高度 ${api.get(6).toFixed(0)}m / 開花直径 ${api.get(7).toFixed(0)}m`);
   raf=requestAnimationFrame(loop);
 }
