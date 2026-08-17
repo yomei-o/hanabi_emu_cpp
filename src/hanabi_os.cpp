@@ -548,8 +548,12 @@ static void burst(Shell sh) {
         double rstar = s.starR * szK * (L == 0 ? 1.0 : 0.82);
         double burnT = s.burnT * (L == 0 ? 1.0 : 0.8) * tb;
         if (sh.type == T_YANAGI) { c0 = C_GOLD; c1 = C_AMBER; chg = 0.35f; tail = C_GOLD; }
-        if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.4f; tail = C_GOLD; }
-        if (sh.type == T_UZU)    { c0 = C_SILVER; c1 = C_GOLD; chg = 0.3f; tail = C_GOLD; }
+        // 蜂・渦蜂の推進薬は金属燃料(Ti/Al/Mg)なので、**噴射は白熱**で出てくる。
+        // 火の粉は放出直後がいちばん熱く、冷えながら 白 → 金 → 橙 → 赤 と落ちる
+        // (下の sim_render の冷却カーブがやる)。tail に金を入れると生まれた瞬間から
+        // オレンジになってしまい、渦が最初から橙色に見えていた
+        if (sh.type == T_HACHI)  { c0 = C_SILVER; c1 = C_GOLD; chg = 0.55f; tail = C_SILVER; }
+        if (sh.type == T_UZU)    { c0 = C_SILVER; c1 = C_GOLD; chg = 0.55f; tail = C_SILVER; }
         // 菊先紅 — 燃焼の最後の1割だけ紅に変わる。錦冠の見せ場
         if (sh.type == T_KAMURO) { c0 = C_GOLD; c1 = C_RED; chg = 0.90f; tail = C_GOLD; }
         if (is_shaped(sh.type))  { c1 = c0; chg = 1.0f; tail = mixc(c0, C_GOLD, 0.25f); }
@@ -1164,8 +1168,15 @@ KEEP uint8_t* sim_render() {
         const Spark& s = sparks[i];
         double sx, sy, sc;
         if (!project(s.x, s.y, s.z, sx, sy, sc)) continue;
+        // 冷却。火の粉は放出直後がいちばん熱く、燃え尽きるにつれて暗く赤くなる。
+        // **黒体の軌跡を2段の折れ線でなぞる**: 出たての色 → 金 → 深い赤。
+        // 1本の直線で「深い赤 ⇄ 出たての色」を補間すると、白熱で出る火花(蜂・渦蜂の
+        // 噴射)が白から一気にピンクへ落ちてしまい、金属の火花に見えない。
+        // 木炭の火の粉(菊の引先)は出たてが既に金なので、この式でも従来どおり金→赤に落ちる。
+        const Col C_EMBER = { 0.95f, 0.16f, 0.03f };
         float lf = s.life / s.life0;
-        Col c = mixc({ 0.95f, 0.16f, 0.03f }, s.c, lf);
+        Col c = (lf > 0.60f) ? mixc(C_GOLD, s.c, (lf - 0.60f) * 2.5f)
+                             : mixc(C_EMBER, C_GOLD, lf * (1.0f / 0.60f));
         float amp = 0.34f * lf * lf * (float)(sc / camF * 520.0);
         splat_point(acc.data(), sx, sy, c, amp);
     }
