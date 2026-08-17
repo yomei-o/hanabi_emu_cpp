@@ -85,7 +85,7 @@ const CONFIG = {
 const $=id=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
 let M=null, api={}, W=0, H=0, img=null, playing=true, raf=0, frames=0, lastT=0, fpsAvg=0;
-let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, selTheme=null;
+let btnStar=null, btnOne=null, btnAuto=null, btnPlay=null, btnVivid=null, selTheme=null;
 // C++ 側 THEMES[] と同じ並び
 const THEMES=["🎲 おまかせ（毎回どれか1つ）","菊 — 色とりどり","🌸 桜 — ピンクの菊だけ",
               "銀世界 — 銀の菊だけ","牡丹","金の柳","蜂","渦蜂","千輪","型物","🏅 錦冠（金冠）","🔥 フェニックス — 大玉横一列＋低い小玉"];
@@ -166,6 +166,11 @@ function buildPanel(){
   btnAuto=mk("⏱ 自動連発");
   onPress(btnAuto,()=>{ api.action(2); syncButtons(); });
 
+  // 光り方(トーンマップ)の切替。ビルドし直さずその場で見比べられる
+  btnVivid=mk("✨ 光り方: キラキラ");
+  btnVivid.title="キラキラ=明るさだけ圧縮して色の向きを保つ / 落ち着いた=成分ごとに圧縮して芯が白く飛ぶ";
+  onPress(btnVivid,()=>{ api.set(15, api.get(16)>0.5?0:1); syncButtons(); });
+
   const btnFs=mk("⛶ フルスクリーン（花火だけ）");
   btnFs.title="花火以外を全部消して全画面に。Esc か F キーで戻る";
   onPress(btnFs,()=>toggleFullscreen());
@@ -210,6 +215,9 @@ function syncButtons(){
   const auto=api.get(5)>0.5;
   setText(btnAuto, auto ? "⏱ 自動連発: ON" : "⏱ 自動連発: OFF");
   btnAuto.classList.toggle("on", auto);
+  const viv=api.get(16)>0.5;
+  setText(btnVivid, viv ? "✨ 光り方: キラキラ" : "🕯 光り方: 落ち着いた");
+  btnVivid.classList.toggle("on", viv);
 }
 
 function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }

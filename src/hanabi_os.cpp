@@ -246,6 +246,7 @@ static double p_hud = 1.0;       // 画面内の文字表示 (0 で花火だけ)
 static double p_crackle = 0.20;   // 消え際にパラパラ(分砲)する玉の割合 0〜1
 static double p_type = -1.0;     // 単発・自動連発の玉の種類 (-1 = おまかせ)
 static double p_theme = 0.0;     // スターマインのテーマ (下の THEMES の添字)
+static double p_vivid = 1.0;     // トーンマップ: 1=色を保つ(キラキラ) 0=成分ごと(落ち着く)
 
 static double simTime = 0.0, launchTimer = 0.5;
 static ShellSpec curSpec;
@@ -895,6 +896,7 @@ KEEP void sim_set(int id, double v) {
     }
     case 13: p_hud = v; break;
     case 14: p_crackle = v < 0 ? 0 : (v > 1 ? 1 : v); break;   // パラパラの割合
+    case 15: p_vivid = v; break;                               // トーンマップ(1=キラキラ)
     }
 }
 
@@ -917,6 +919,7 @@ KEEP double sim_get(int id) {
     case 13: return (double)curTheme;    // この連打で実際に使われているテーマ
     case 14: return starTimer;           // 次の自動スターマインまで [s]
     case 15: return p_starInt;
+    case 16: return p_vivid;
     }
     return 0.0;
 }
@@ -1168,6 +1171,15 @@ KEEP uint8_t* sim_render() {
     }
 
     // 星頭 — 輝度は燃焼表面積 (r/r0)^2 に比例
+    //
+    // **尾を引かない星(牡丹・型物)の明るさ補正。**
+    // acc は毎フレーム p_glow 倍して溜めるので、その場に留まる光源は
+    // 1/(1-p_glow) 倍 — 既定の 0.82 なら **5.6倍** まで積み上がる。
+    // 一方 accN は毎フレーム消すので 1倍のまま。同じ amp で撃っていても、
+    // 開ききって速度が落ちた頃には菊が牡丹の5倍明るいことになっていた
+    // (これが「牡丹だけ暗い」の正体)。実際には星は動いていて残光は筋に散るので、
+    // 積み上がりぶんを丸ごと足すと今度は明るすぎる。半分強を補う。
+    const float hardGain = 1.0f + 0.55f * (float)(1.0 / (1.0 - p_glow) - 1.0);
     for (size_t i = 0; i < stars.size(); ++i) {
         const Star& st = stars[i];
         if (st.delay > 0.0f) continue;          // 暗飛行中は光らない
@@ -1184,10 +1196,10 @@ KEEP uint8_t* sim_render() {
         if (st.trail >= 0.999f) {
             splat_disc(acc.data(), sx, sy, rad, c, amp);
         } else if (st.trail <= 0.001f) {
-            splat_disc(accN.data(), sx, sy, rad, c, amp);
+            splat_disc(accN.data(), sx, sy, rad, c, amp * hardGain);
         } else {
             splat_disc(acc.data(),  sx, sy, rad, c, amp * st.trail);
-            splat_disc(accN.data(), sx, sy, rad, c, amp * (1.0f - st.trail));
+            splat_disc(accN.data(), sx, sy, rad, c, amp * (1.0f - st.trail) * hardGain);
         }
     }
 
@@ -1200,34 +1212,36 @@ KEEP uint8_t* sim_render() {
         splat_disc(acc.data(), sx, sy, (float)(fl.pw * t), { 1.0f, 0.92f, 0.72f }, 2.2f * t * t);
     }
 
-    // トーンマップして夜空に合成
+    // トーンマップして夜空に合成。**実行時に2つの式を切り替えられる**(`sim_set(15, ..)`)。
     //
-    // **既定は成分ごとの r/(1+r)。** 明るいところから順に色が抜けるので、明るい芯は
-    // クリーム色〜白へ寄り、色は暗い先端に残る。フィルムやセンサが飽和したときの
-    // 写り方に近く、花火ではこれが自然に見える。
+    //   vivid=1 (既定) — 明るさ(最大成分)だけ圧縮して**色の向きを保つ**。
+    //     色が最後まで残るのでキラキラして見える。芯は smoothstep(4,16) から上で白へ飛ぶ。
+    //   vivid=0        — 成分ごとの r/(1+r)。明るいところから順に色が抜けるので、
+    //     明るい芯はクリーム色〜白へ寄り、色は暗い先端に残る。フィルムやセンサが
+    //     飽和したときの写り方に近い、落ち着いた見え方。
     //
-    // `-DLIGHT_VIVID` で、明るさ(最大成分)だけ圧縮して色の向きを保つ式に切り替わる。
-    // 色は最後まで残るが、**花火では鮮やかすぎて嘘っぽく見える**(2026-08-14 にユーザ判断で
-    // 既定から外した)。点光源の粒がはっきり分かれている drone_emu_cpp では、こちらのほうが
-    // 実物に近かった。同じ式でも題材で結論が変わるので、両方ビルドして
-    // compare.html で見比べられるようにしてある。
+    // 2026-08-14 に一度「鮮やかすぎて嘘っぽい」で vivid を既定から外したが、
+    // 2026-08-17 に「キラキラのほうを入れてみて」と再要望があり既定に戻した。
+    // ビルドし直さずボタンで見比べられるので、どちらでも選べる形にしてある。
+    const bool vivid = (p_vivid > 0.5);
     for (size_t i = 0, np = (size_t)FW * FH; i < np; ++i) {
         float r = acc[i * 3] + accN[i * 3], g = acc[i * 3 + 1] + accN[i * 3 + 1],
               b = acc[i * 3 + 2] + accN[i * 3 + 2];
         if (r + g + b < 0.004f) { px[i] = bg[i]; continue; }
-#ifdef LIGHT_VIVID
-        float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        float t = mx / (1.0f + mx);           // 圧縮した明るさ
-        float s = t / mx;                     // 色の向きを保ったまま合わせる倍率
-        float wht = smoothstep(4.0f, 16.0f, mx);   // ここから上は飛んで白くなる
-        int R = (int)(255.0f * (r * s + (t - r * s) * wht));
-        int G = (int)(255.0f * (g * s + (t - g * s) * wht));
-        int B = (int)(255.0f * (b * s + (t - b * s) * wht));
-#else
-        int R = (int)(255.0f * (r / (1.0f + r)));
-        int G = (int)(255.0f * (g / (1.0f + g)));
-        int B = (int)(255.0f * (b / (1.0f + b)));
-#endif
+        int R, G, B;
+        if (vivid) {
+            float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            float t = mx / (1.0f + mx);           // 圧縮した明るさ
+            float s = t / mx;                     // 色の向きを保ったまま合わせる倍率
+            float wht = smoothstep(4.0f, 16.0f, mx);   // ここから上は飛んで白くなる
+            R = (int)(255.0f * (r * s + (t - r * s) * wht));
+            G = (int)(255.0f * (g * s + (t - g * s) * wht));
+            B = (int)(255.0f * (b * s + (t - b * s) * wht));
+        } else {
+            R = (int)(255.0f * (r / (1.0f + r)));
+            G = (int)(255.0f * (g / (1.0f + g)));
+            B = (int)(255.0f * (b / (1.0f + b)));
+        }
         uint32_t d = bg[i];
         R += (int)(d & 255); G += (int)((d >> 8) & 255); B += (int)((d >> 16) & 255);
         px[i] = rgb(R > 255 ? 255 : R, G > 255 ? 255 : G, B > 255 ? 255 : B);
@@ -1272,6 +1286,7 @@ int main(int argc, char** argv) {
     if (argc > 6) sim_set(12, atof(argv[6]));     // 7番目の引数 = 自動スターマインの間隔
     if (argc > 7) sim_set(13, atof(argv[7]));     // 8番目の引数 = 0 で HUD の文字を消す
     if (argc > 8) sim_set(0,  atof(argv[8]));     // 9番目の引数 = 号数
+    if (argc > 9) sim_set(15, atof(argv[9]));     // 10番目の引数 = トーンマップ(1=キラキラ 0=従来)
     if (barrage) { sim_set(7, barrage); sim_action(3); }
     for (int i = 0; i < steps; ++i) {
         sim_step(1); sim_render();                                   // 毎フレーム描画 = 実負荷
